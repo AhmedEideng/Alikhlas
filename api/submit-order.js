@@ -1,0 +1,479 @@
+import { MAX_ORDER_UNITS } from "../config/order-limits.js";
+import { createRateLimiter } from "./lib/rate-limiter.js";
+
+/**
+ * 🔒 منع حقن الصيغ (CSV/Sheet Formula Injection):
+ * `Range.setValues` في Google Sheets يفسّر أي نص يبدأ بـ = + - @ كصيغة، فنص
+ * يكتبه العميل في الاسم أو العنوان أو الملاحظات مثل `=IMPORTXML("http://…")`
+ * يُنفَّذ عند فتح الشيت. نُسبق هذه الحالات بعلامة اقتباس (تُخفيها Sheets ولا
+ * تظهر في الخلية) فيبقى النص نصًا.
+ * @param {unknown} value
+ * @returns {unknown}
+ */
+export function neutralizeFormula(value) {
+  if (typeof value !== "string") return value;
+  return /^[=+\-@\t\r]/.test(value) ? `'${value}` : value;
+}
+import { getClientIp } from "./lib/request-ip.js";
+import {
+  allowedOrigins,
+  getRequestOrigin,
+  isAllowedOrigin,
+  readPayload,
+} from "./lib/request-guards.js";
+import { readFileSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const PRODUCTS_DB_PATH = join(__dirname, "lib", "products-db.json");
+const CONFIG_DB_PATH = join(__dirname, "lib", "config-db.json");
+const BUNDLES_DB_PATH = join(__dirname, "lib", "bundles-db.json");
+
+// نسبة خصم الباقة — Single Source of Truth: src/lib/bundle-discount.ts،
+// وتصل للـ API عبر config-db.json (مولّد وقت البناء).
+// بـ 500 configuration بدل fallback صامت لقيمة ممكن تكون قديمة —
+// fallback صامت = الفرونت يعرض نسبة جديدة والسيرفر يحسب قديمة
+// = drift صامت في أسعار الخصم.
+/** @returns {number} */
+function getBundleDiscountRate() {
+  const configDb = getConfigDb();
+  if (typeof configDb.BUNDLE_DISCOUNT_RATE === "number") {
+    return configDb.BUNDLE_DISCOUNT_RATE;
+  }
+  throw new Error(
+    "config-db.json missing BUNDLE_DISCOUNT_RATE (broken build artifact — run npm run build)",
+  );
+}
+
+// مخازن ذاكرة مؤقتة (In-memory Caching) لتسريع أداء السيرفر السحابي وتجنب القراءة المتكررة من القرص الصلب
+/**
+ * @typedef {{
+ *   GOVERNORATE_SHIPPING: Array<{ name: string, shipping: number }>,
+ *   FREE_SHIPPING_THRESHOLD: number,
+ *   PROMO_TIERS: Array<{ threshold: number, discount: number }>,
+ *   BUNDLE_DISCOUNT_RATE?: number
+ * }} ConfigDb
+ */
+
+/** @type {Array<Record<string, any>> | null} */
+let cachedProductsDb = null;
+/** @type {ConfigDb | null} */
+let cachedConfigDb = null;
+/** @type {Record<string, string[]> | null} */
+let cachedBundlesDb = null;
+
+// جلب كتالوج المنتجات المعتمد المولد تلقائياً وقت البناء للتحقق الخلفي (Server-side Price Lookup)
+/** @returns {Array<Record<string, any>>} */
+function getProductsDb() {
+  if (cachedProductsDb) return cachedProductsDb;
+  try {
+    const parsed = JSON.parse(readFileSync(PRODUCTS_DB_PATH, "utf-8"));
+    cachedProductsDb = parsed;
+    return parsed;
+  } catch (err) {
+    console.error("Failed to load products-db.json:", err);
+    return [];
+  }
+}
+
+// جلب خريطة الباقات المعتمدة (مولّدة وقت البناء من نفس محرك cross-sell)
+// للتحقق الخلفي من خصم الباقة — لا نثق بقيمة العميل إطلاقاً.
+/** @returns {Record<string, string[]>} */
+function getBundlesDb() {
+  if (cachedBundlesDb) return cachedBundlesDb;
+  try {
+    const parsed = JSON.parse(readFileSync(BUNDLES_DB_PATH, "utf-8"));
+    cachedBundlesDb = parsed;
+    return parsed;
+  } catch (err) {
+    // بدون خريطة باكات لا يوجد خصم باقة ممكن (fail-closed): الأمان قبل التوفير.
+    console.error("Failed to load bundles-db.json:", err);
+    return {};
+  }
+}
+
+// جلب إعدادات الشحن والعروض الترويجية المشتركة (Single Source of Truth) لمنع أي تضارب بين الفرونت والباك
+/** @returns {ConfigDb} */
+function getConfigDb() {
+  if (cachedConfigDb) return cachedConfigDb;
+  try {
+    const parsed = JSON.parse(readFileSync(CONFIG_DB_PATH, "utf-8"));
+    cachedConfigDb = parsed;
+    return parsed;
+  } catch (err) {
+    console.error("Failed to load config-db.json, using safe fallbacks:", err);
+    return {
+      GOVERNORATE_SHIPPING: [],
+      FREE_SHIPPING_THRESHOLD: 2000,
+      PROMO_TIERS: [],
+    };
+  }
+}
+
+// حرفيًا في 5 ملفات — وأحدها نُسي فرفض بيئات المعاينة).
+const ALLOWED_ORIGINS = allowedOrigins();
+
+const MAX_BODY_SIZE_BYTES = 64_000;
+// هدامة (50 SKU × 5000 = 250,000 وحدة). 100 = سخي جدًا لعميل حقيقي
+// وواقعي كحد تشغيلي (الشحن يدوي).
+
+export const GOOGLE_SHEETS_TIMEOUT_MS = 10_000;
+
+// Fast per-instance limit; Google Apps Script applies a second per-phone limit.
+const rateLimiter = createRateLimiter({
+  windowMs: 60_000,
+  max: 30,
+  prefix: "submit-order",
+});
+
+/** @param {unknown} value @param {number} maxLength */
+function isNonEmptyString(value, maxLength) {
+  return typeof value === "string" && value.trim().length > 0 && value.length <= maxLength;
+}
+
+/** @param {string} governorate @param {number} [subtotal] */
+export function getShippingCost(governorate, subtotal = 0) {
+  const config = getConfigDb();
+  if (subtotal >= config.FREE_SHIPPING_THRESHOLD) return 0; // شحن مجاني عند تخطي الحد الأدنى
+  const normalized = String(governorate).trim().replace(/\s+/g, " ");
+  const found = config.GOVERNORATE_SHIPPING.find((g) => g.name === normalized);
+  return found ? found.shipping : 70;
+}
+
+function isPromotionEnabled() {
+  return true;
+}
+
+/** @param {number} subtotal */
+function calcDiscount(subtotal) {
+  if (!isPromotionEnabled()) return 0;
+  const config = getConfigDb();
+  // البحث عن فئة الخصم المطابقة من المصفوفة المرتبة من الأعلى للأدنى
+  const foundTier = config.PROMO_TIERS.find((tier) => subtotal >= tier.threshold);
+  if (!foundTier) return 0;
+  return Math.round(subtotal * foundTier.discount);
+}
+
+// 🎁 إعادة حساب خصم الباقة من الكتالوج الرسمي (نفس خوارزمية الفرونت):
+// كل باقة = منتج رئيسي + مقترحاته؛ تكتمل إذا وُجد كل أعضائها بكمية ≥ 1.
+// يُعتمد أفضل باقة واحدة فقط (الأعلى قيمة) — حتمي ومحصّن ضد التلاعب.
+/** @param {Array<{ id: string, qty: number }>} items */
+function calcBundleDiscount(items) {
+  const bundlesDb = getBundlesDb();
+  const productsDb = getProductsDb();
+  const qtyById = new Map(items.map((item) => [item.id, item.qty]));
+  const bundleRate = getBundleDiscountRate();
+  let best = 0;
+  // underscore prefix عشان تبقى الـ noUnusedLocals سعيدة
+  for (const [_mainId, memberIds] of Object.entries(bundlesDb)) {
+    if (!memberIds.every((id) => (qtyById.get(id) ?? 0) >= 1)) continue;
+    const unitSum = memberIds.reduce((sum, id) => {
+      const official = productsDb.find((p) => p.id === id);
+      return sum + (official ? official.price : 0);
+    }, 0);
+    const value = Math.round(unitSum * bundleRate);
+    if (value > best) best = value;
+  }
+  return best;
+}
+
+// 🔒 دالة التحقق الأمني والرياضي الصارم من سلامة الأسعار ومحتويات الطلب
+/** @param {Record<string, any> | null | undefined} payload */
+export function validateOrderPayload(payload) {
+  // JSON primitives, null and arrays are never valid order objects.
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return "Invalid payload";
+  }
+  // Prototype pollution protection - reject dangerous keys
+  const dangerousKeys = ["__proto__", "constructor", "prototype"];
+  for (const key of Object.keys(payload)) {
+    if (dangerousKeys.includes(key)) return "Invalid payload key";
+  }
+  if (!isNonEmptyString(payload.orderId, 60)) return "Invalid orderId";
+  // Strict orderId pattern: IK-... with optional leading # (allows test fixtures)
+  if (!/^#?IK-[A-Z0-9-]{4,60}$/.test(payload.orderId)) return "Invalid orderId format";
+  if (!isNonEmptyString(payload.customerName, 120)) return "Invalid customerName";
+
+  const phoneStr = String(payload.customerPhone || "").trim();
+  const isLocalEgypt = /^01[0125][0-9]{8}$/.test(phoneStr);
+  const isInternational = /^\+[1-9][0-9]{6,14}$/.test(phoneStr);
+  if (!isLocalEgypt && !isInternational) {
+    return "Invalid customerPhone";
+  }
+
+  if (!new Set(["cart", "شراء فوري"]).has(payload.orderType)) return "Invalid orderType";
+  if (!new Set(["واتساب", "طلب مباشر"]).has(payload.paymentMethod)) return "Invalid paymentMethod";
+  if (!isNonEmptyString(payload.address, 200)) return "Invalid address";
+  if (
+    payload.notes !== undefined &&
+    (typeof payload.notes !== "string" || payload.notes.length > 300)
+  )
+    return "Invalid notes";
+  if (typeof payload.bundleDiscount !== "number" || !Number.isFinite(payload.bundleDiscount)) {
+    return "Invalid bundleDiscount";
+  }
+
+  if (!isNonEmptyString(payload.governorate, 80)) return "Invalid governorate";
+  const normalizedGovernorate = payload.governorate.trim().replace(/\s+/g, " ");
+  const validGovernorate = getConfigDb().GOVERNORATE_SHIPPING.some(
+    (entry) => entry.name === normalizedGovernorate,
+  );
+  if (!validGovernorate) return "Invalid governorate";
+  // Keep the canonical spelling that is shared with the frontend/config DB.
+  payload.governorate = normalizedGovernorate;
+
+  if (!Array.isArray(payload.items) || payload.items.length === 0 || payload.items.length > 50)
+    return "Invalid items";
+
+  const productsDb = getProductsDb();
+  let calculatedSubtotal = 0;
+
+  // فيمكن تجاوز المخزون بسطرين من نفس المنتج (5000 + 5000 على stock 5000).
+  // السلة الحقيقية لا تنتج سطوراً مكررة — أي تكرار = طلب مشبوه نرفضه فوراً.
+  /** @type {Map<string, number>} */
+  const qtyByProduct = new Map();
+  for (const item of payload.items) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return "Invalid item structure";
+    if (!isNonEmptyString(item.id, 30) || !isNonEmptyString(item.name, 180))
+      return "Invalid item structure";
+    const quantity = Number(item.qty);
+    // سق فني مريح أعلى بكثير من سقف المخزون الفعلي (5000 لكل منتج حالياً) —
+    // الحد الحقيقي هو فحص "Quantity exceeds stock" أدناه على إجمالي الكميات.
+    if (!Number.isInteger(quantity) || quantity < 1 || quantity > 9999)
+      return "Invalid item quantity";
+    if (qtyByProduct.has(item.id)) {
+      return `Duplicate product in order: ${item.id}`;
+    }
+    qtyByProduct.set(item.id, quantity);
+
+    // 🔒 البحث عن المنتج بالكتالوج الرسمي المعتمد في السيرفر للتحقق من سعره الحقيقي
+    const officialProduct = productsDb.find((p) => p.id === item.id);
+    if (!officialProduct) {
+      return `Product with ID ${item.id} not found in official catalog`;
+    }
+    if (!Number.isInteger(officialProduct.stock) || officialProduct.stock < 1) {
+      return `Product out of stock: ${item.id}`;
+    }
+
+    // تفعيل مبدأ "مصدر الحقيقة الموحد" واستبدال الاسم المرسل من العميل بالاسم الرسمي المعتمد في الكتالوج لمنع ثغرات الحقن
+    item.name = officialProduct.name;
+
+    // منع تلاعب العميل بقيمة سعر المنتج الفردي
+    if (Number(item.price) !== officialProduct.price) {
+      return `Price mismatch for product: ${item.name}. Submitted: ${item.price}, Official: ${officialProduct.price}`;
+    }
+
+    calculatedSubtotal += officialProduct.price * quantity;
+  }
+
+  // 🔒 فحص المخزون على الإجمالي المجمّع لكل منتج (بعد منع التكرار أعلاه)
+  for (const [productId, totalQty] of qtyByProduct) {
+    const officialProduct = productsDb.find((p) => p.id === productId);
+    // وجوده في الحلقة اللي فوق، بس الـ defense-in-depth هنا أرخص من أي
+    // crash مستقبلي لو اتعدل الترتيب.
+    if (!officialProduct || totalQty > officialProduct.stock) {
+      return `Quantity exceeds stock for product: ${productId}`;
+    }
+  }
+
+  // مش طلب حقيقي (abuse/risks تشغيلية — الشحن يدوي). سقف 100 وحدة إجمالي
+  // = 20× أكبر طلب حقيقي متوقع، ولسه سخي جدًا لأي عميل حقيقي.
+  const totalUnits = [...qtyByProduct.values()].reduce((sum, q) => sum + q, 0);
+  if (totalUnits > MAX_ORDER_UNITS) {
+    return `Order exceeds maximum of ${MAX_ORDER_UNITS} total units`;
+  }
+
+  // 🔒 التحقق الصارم من صحة الحقول المالية الإجمالية
+  if (Number(payload.subtotalBeforeDiscount) !== calculatedSubtotal) {
+    return "Subtotal before discount mismatch";
+  }
+
+  // 🎁 خصم الباقة يُعاد حسابه من خريطة الباقات المعتمدة (لا ثقة بقيمة العميل)
+  const calculatedBundleDiscount = calcBundleDiscount(payload.items);
+  if (Number(payload.bundleDiscount) !== calculatedBundleDiscount) {
+    return "Bundle discount mismatch";
+  }
+
+  // 🔀 الخصمان متبادلا الاستبعاد (نفس قاعدة الفرونت):
+  // عند اكتمال باقة → خصم الباقة هو الخصم الوحيد، وخصم الشرائح موقوف لهذا الطلب
+  const calculatedDiscount = calculatedBundleDiscount > 0 ? 0 : calcDiscount(calculatedSubtotal);
+  if (Number(payload.discount) !== calculatedDiscount) {
+    return "Discount mismatch";
+  }
+
+  const calculatedSubtotalAfterDiscount =
+    calculatedSubtotal - calculatedDiscount - calculatedBundleDiscount;
+  if (Number(payload.subtotal) !== calculatedSubtotalAfterDiscount) {
+    return "Subtotal after discount mismatch";
+  }
+
+  const calculatedShipping = getShippingCost(payload.governorate, calculatedSubtotal);
+  if (Number(payload.shipping) !== calculatedShipping) {
+    return "Shipping cost mismatch";
+  }
+
+  const calculatedTotal = calculatedSubtotalAfterDiscount + calculatedShipping;
+  if (Number(payload.total) !== calculatedTotal) {
+    return "Grand total mismatch";
+  }
+
+  return undefined;
+}
+
+/**
+ * @param {import("express").Request} req
+ * @param {import("express").Response} res
+ */
+export default async function handler(req, res) {
+  const requestOrigin = getRequestOrigin(req);
+  const corsOrigin =
+    requestOrigin && ALLOWED_ORIGINS.has(requestOrigin)
+      ? requestOrigin
+      : "https://alikhlasmedical.store";
+
+  res.setHeader("Access-Control-Allow-Origin", corsOrigin);
+  res.setHeader("Vary", "Origin");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+  if (req.method === "OPTIONS") return res.status(204).end();
+  if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
+  if (!isAllowedOrigin(req, ALLOWED_ORIGINS))
+    return res.status(403).json({ error: "Forbidden origin" });
+
+  const clientIp = getClientIp(req);
+  if (!(await rateLimiter.check(clientIp))) {
+    return res.status(429).json({ error: "Rate limit exceeded" });
+  }
+
+  // إمّا يعيّنها في try أو يرجع من catch — لا قراءة للقيمة الابتدائية.
+  /** @type {Record<string, any> | null} */
+  let payload;
+  try {
+    payload = readPayload(req, MAX_BODY_SIZE_BYTES);
+  } catch {
+    return res.status(400).json({ error: "Invalid JSON payload" });
+  }
+  // الـ guard ده تحوط إضافي + يضيّق النوع بعد الـ try/catch (CFA ما
+  // يتتبعش عبره). نفس رسالة validateOrderPayload(null) = سلوك موحد.
+  if (!payload) return res.status(400).json({ error: "Invalid payload" });
+
+  // 🔒 الأمان عبر CORS + Origin checking + Rate Limiting + Payload Validation
+  // لم نعد نستخدم HMAC CSRF token بمفتاح مكشوف في الـ client bundle
+  let payloadError;
+  try {
+    payloadError = validateOrderPayload(payload);
+  } catch (err) {
+    // throw غير معالج — fail-closed واضح للسيرفر بدل 500 عامي من المنصة.
+    console.error(
+      "Order validation configuration error:",
+      err instanceof Error ? err.message : String(err),
+    );
+    return res.status(500).json({ error: "Server configuration error" });
+  }
+  if (payloadError) return res.status(400).json({ error: payloadError });
+
+  const SHEET_URL = process.env.GOOGLE_SHEETS_WEBHOOK_URL;
+  if (!SHEET_URL) {
+    console.error("Missing GOOGLE_SHEETS_WEBHOOK_URL environment variable.");
+    return res.status(500).json({ error: "Server configuration error" });
+  }
+  // Script fail-closed ويرفض كل كتابة بدون السر — لو المتغير ناقص في الإنتاج،
+  // كل طلب هيرجع 502 غامض. نكشف المشكلة من المصدر (500 configuration).
+  // في dev/test مفيش enforcement — عشان ما نتحكمش في بيئات الاختبار المحلية.
+  const SHEET_SECRET = process.env.GOOGLE_SHEETS_WEBHOOK_SECRET;
+  if (!SHEET_SECRET && process.env.NODE_ENV === "production") {
+    console.error(
+      "Missing GOOGLE_SHEETS_WEBHOOK_SECRET — the Apps Script webhook is fail-closed and will reject every write. Set it (same value as WEBHOOK_SECRET in the script).",
+    );
+    return res.status(500).json({ error: "Server configuration error" });
+  }
+
+  // 🔒 قائمة بيضاء صارمة للحقول المرسلة إلى الشيت — نُمرّر الحقول المعروفة فقط.
+  // يمنع تمرير مفاتيح تحكمية من العميل (مثل __proto__/constructor → Prototype Pollution)
+  // أو حقول إضافية زائدة قد تُسجَّل في الشيت بلا ضرورة.
+  const ALLOWED_ORDER_FIELDS = new Set([
+    "orderId",
+    "orderType",
+    "paymentMethod",
+    "customerName",
+    "customerPhone",
+    "governorate",
+    "address",
+    "notes",
+    "items",
+    "subtotalBeforeDiscount",
+    "discount",
+    "bundleDiscount",
+    "subtotal",
+    "shipping",
+    "total",
+  ]);
+  /** @type {Record<string, unknown>} */
+  const safePayload = {};
+  for (const key of ALLOWED_ORDER_FIELDS) {
+    if (payload[key] !== undefined) safePayload[key] = payload[key];
+  }
+  // 🔒 النصوص الحرة فقط (الاسم/العنوان/الملاحظات) — الأرقام والمعرّفات لا تُلمس.
+  for (const key of ["customerName", "address", "notes"]) {
+    if (typeof safePayload[key] === "string") {
+      safePayload[key] = neutralizeFormula(safePayload[key]);
+    }
+  }
+
+  const sheetsController = new AbortController();
+  const sheetsTimeout = setTimeout(() => sheetsController.abort(), GOOGLE_SHEETS_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(SHEET_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        // 🔒 سر الكتابة (اختياري — يفعَّل بمتغير GOOGLE_SHEETS_WEBHOOK_SECRET):
+        // يحمي webhook من الكتابة المباشرة لو تسرّب الرابط
+        data: JSON.stringify({
+          ...safePayload,
+          secret: SHEET_SECRET,
+        }),
+      }),
+      signal: sheetsController.signal,
+    });
+    if (!response.ok) {
+      // 🔒 لا نمرر الرد الكامل للسجل — نقتصر على أول 200 حرف لمنع تسجيل أي
+      // بيانات قد يعيدها الشيت، ومنع حشر سجلات ضخمة (log flooding).
+      const text = (await response.text().catch(() => "")).slice(0, 200);
+      console.error(`Google Sheets Webhook error (${response.status}):`, text);
+      return res
+        .status(500)
+        .json({ error: "تعذر إرسال الطلب إلى قاعدة البيانات السحابية. يرجى المحاولة مجدداً." });
+    }
+    const result = await response.json();
+    // Apps Script returns HTTP 200 for both logical success and logical failure.
+    // Convert a rejected write into an HTTP error so the client never mistakes it
+    // for a completed order. Only the safe public error string is forwarded.
+    if (!result?.success) {
+      return res.status(502).json({
+        error:
+          typeof result?.error === "string"
+            ? result.error.slice(0, 200)
+            : "تعذر تسجيل الطلب في قاعدة البيانات السحابية.",
+      });
+    }
+    return res.status(200).json({
+      success: true,
+      orderId: typeof result?.orderId === "string" ? result.orderId : undefined,
+    });
+  } catch (err) {
+    if (sheetsController.signal.aborted) {
+      console.error(`Google Sheets request timed out after ${GOOGLE_SHEETS_TIMEOUT_MS}ms`);
+      return res.status(504).json({
+        error: "انتهت مهلة الاتصال بقاعدة البيانات السحابية. يرجى المحاولة مجدداً.",
+      });
+    }
+    console.error("Error submitting order:", err);
+    return res.status(500).json({ error: "Internal server error" });
+  } finally {
+    clearTimeout(sheetsTimeout);
+  }
+}

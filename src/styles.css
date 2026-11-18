@@ -1,0 +1,302 @@
+@import "tailwindcss" source(none);
+@source "../src";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --radius-2xl: calc(var(--radius) + 8px);
+  --radius-3xl: calc(var(--radius) + 12px);
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary-glow: var(--primary-glow);
+  --color-gold: var(--gold);
+  --color-gold-soft: var(--gold-soft);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-success: var(--success);
+  --color-success-foreground: var(--success-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --font-sans: "Cairo", "Cairo Fallback", system-ui, sans-serif;
+  --font-display: "Cairo", "Cairo Fallback", system-ui, sans-serif;
+}
+
+/* ============================================================
+ * Color tokens with sRGB fallbacks for old browsers (Chrome <111,
+ * Safari <15.4, Windows 7). Each token has hex/rgba first, then
+ * the modern oklch(). Old browsers ignore the second declaration.
+ * Royal Emerald Green & Luxury Gold Identity — Al Ikhlas Medical
+ * ============================================================ */
+:root {
+  --radius: 1rem;
+
+  --background: #f8fcf9;
+  --background: oklch(0.99 0.006 155);
+  --foreground: #071f13;
+  --foreground: oklch(0.18 0.04 155);
+
+  --card: #ffffff;
+  --card: oklch(1 0 0);
+  --card-foreground: #071f13;
+  --card-foreground: oklch(0.18 0.04 155);
+
+  --popover: #ffffff;
+  --popover: oklch(1 0 0);
+  --popover-foreground: #071f13;
+  --popover-foreground: oklch(0.18 0.04 155);
+
+  --primary: #0b6b3a;
+  --primary: oklch(0.47 0.12 155);
+  --primary-foreground: #ffffff;
+  --primary-foreground: oklch(1 0 0);
+  --primary-glow: #d4a017;
+  --primary-glow: oklch(0.74 0.15 82);
+
+  /* ── إطار ذهبي لصور المنتجات (بدل الحدّ الزمردي) ── */
+  --gold: #d4a017;
+  --gold-soft: #e8d9a8;
+
+  --secondary: #e7f6ee;
+  --secondary: oklch(0.96 0.025 155);
+  --secondary-foreground: #08381f;
+  --secondary-foreground: oklch(0.28 0.06 155);
+
+  --muted: #e6efe9;
+  --muted: oklch(0.94 0.012 155);
+  --muted-foreground: #3b5848;
+  --muted-foreground: oklch(0.44 0.04 155);
+
+  --accent: #f6eed9;
+  --accent: oklch(0.95 0.035 85);
+  --accent-foreground: #08381f;
+  --accent-foreground: oklch(0.28 0.06 155);
+
+  --destructive: #ea0000;
+  --destructive: oklch(0.55 0.28 27);
+  --destructive-foreground: #ffffff;
+  --destructive-foreground: oklch(1 0 0);
+
+  --success: #0d7a43;
+  --success: oklch(0.53 0.13 155);
+  --success-foreground: #ffffff;
+  --success-foreground: oklch(1 0 0);
+
+  --border: #d4e4da;
+  --border: oklch(0.91 0.018 155);
+  --input: #dceae1;
+  --input: oklch(0.93 0.016 155);
+  --ring: rgba(11, 107, 58, 0.35);
+  --ring: oklch(0.47 0.12 155 / 0.35);
+
+  --gradient-hero: linear-gradient(135deg, #084d2a 0%, #0d7a43 55%, #c8961e 100%);
+  --gradient-hero: linear-gradient(
+    135deg,
+    oklch(0.38 0.1 155) 0%,
+    oklch(0.53 0.13 155) 55%,
+    oklch(0.71 0.14 82) 100%
+  );
+
+  --gradient-soft: linear-gradient(180deg, #f3faf5 0%, #ffffff 100%);
+  --gradient-soft: linear-gradient(180deg, oklch(0.98 0.012 155) 0%, oklch(1 0 0) 100%);
+
+  --gradient-brand: linear-gradient(135deg, #08522c, #0d7a43);
+  --gradient-brand: linear-gradient(135deg, oklch(0.41 0.11 155), oklch(0.53 0.13 155));
+
+  --shadow-sm: 0 2px 4px rgba(6, 46, 26, 0.04);
+  --shadow-sm: 0 2px 4px oklch(0.2 0.08 155 / 0.04);
+  --shadow-md: 0 12px 24px -8px rgba(6, 56, 30, 0.12);
+  --shadow-md: 0 12px 24px -8px oklch(0.22 0.11 155 / 0.12);
+  --shadow-lg: 0 25px 50px -12px rgba(6, 56, 30, 0.2);
+  --shadow-lg: 0 25px 50px -12px oklch(0.22 0.13 155 / 0.2);
+  --shadow-glow: 0 0 40px rgba(212, 160, 23, 0.32);
+  --shadow-glow: 0 0 40px oklch(0.74 0.15 82 / 0.32);
+
+  --transition-smooth: all 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.dark {
+  --background: #04120b;
+  --background: oklch(0.14 0.03 155);
+  --foreground: #f4faf6;
+  --foreground: oklch(0.98 0.005 155);
+  --card: #081e13;
+  --card: oklch(0.18 0.04 155);
+  --primary: #d4a017;
+  --primary: oklch(0.74 0.15 82);
+  --primary-foreground: #04120b;
+  --primary-foreground: oklch(0.14 0.03 155);
+  --border: rgba(255, 255, 255, 0.08);
+  --border: oklch(1 0 0 / 0.08);
+  --gold: #e6b83a;
+  --gold-soft: #a8842c;
+  --destructive: #ff0000;
+  --destructive: oklch(0.65 0.3 27);
+}
+
+@layer base {
+  *,
+  *::before,
+  *::after {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+  }
+
+  html {
+    direction: rtl;
+    overflow-x: hidden;
+    max-width: 100%;
+  }
+
+  body {
+    overflow-x: hidden;
+    max-width: 100%;
+  }
+
+  * {
+    border-color: var(--color-border);
+  }
+  body {
+    background-color: var(--color-background);
+    color: var(--color-foreground);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+  }
+  h1,
+  h2,
+  h3,
+  h4 {
+    font-weight: 800;
+    letter-spacing: -0.02em;
+  }
+}
+
+@layer utilities {
+  .bg-gradient-brand {
+    background-image: var(--gradient-brand);
+  }
+  .shadow-card {
+    box-shadow: var(--shadow-md);
+  }
+  .transition-smooth {
+    transition: var(--transition-smooth);
+  }
+
+  .skeleton {
+    overflow: hidden;
+    background-color: #e6efe9;
+    background-color: oklch(0.94 0.012 155);
+  }
+  .skeleton::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    transform: translateX(-100%);
+    background-image: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.4), transparent);
+    animation: shimmer 2s infinite linear;
+  }
+}
+
+/* ============================================================
+ * Hard fallback for browsers that don't support oklch() at all.
+ * ============================================================ */
+@supports not (color: oklch(0% 0 0)) {
+  :root {
+    --background: #f8fcf9;
+    --foreground: #071f13;
+    --card: #ffffff;
+    --card-foreground: #071f13;
+    --popover: #ffffff;
+    --popover-foreground: #071f13;
+    --primary: #0b6b3a;
+    --primary-foreground: #ffffff;
+    --primary-glow: #d4a017;
+    --secondary: #e7f6ee;
+    --secondary-foreground: #08381f;
+    --muted: #e6efe9;
+    --muted-foreground: #3b5848;
+    --accent: #f6eed9;
+    --accent-foreground: #08381f;
+    --destructive: #ea0000;
+    --destructive-foreground: #ffffff;
+    --success: #0d7a43;
+    --success-foreground: #ffffff;
+    --border: #d4e4da;
+    --input: #dceae1;
+    --ring: rgba(11, 107, 58, 0.35);
+    --gradient-hero: linear-gradient(135deg, #084d2a 0%, #0d7a43 55%, #c8961e 100%);
+    --gradient-soft: linear-gradient(180deg, #f3faf5 0%, #ffffff 100%);
+    --gradient-brand: linear-gradient(135deg, #08522c, #0d7a43);
+    --shadow-sm: 0 2px 4px rgba(6, 46, 26, 0.04);
+    --shadow-md: 0 12px 24px -8px rgba(6, 56, 30, 0.12);
+    --shadow-lg: 0 25px 50px -12px rgba(6, 56, 30, 0.2);
+    --shadow-glow: 0 0 40px rgba(212, 160, 23, 0.32);
+  }
+
+  .dark {
+    --background: #04120b;
+    --foreground: #f4faf6;
+    --card: #081e13;
+    --primary: #d4a017;
+    --primary-foreground: #04120b;
+    --border: rgba(255, 255, 255, 0.08);
+    --destructive: #ff0000;
+  }
+
+  .skeleton {
+    background-color: #e6efe9;
+  }
+}
+
+@keyframes shimmer {
+  100% {
+    transform: translateX(100%);
+  }
+}
+
+html,
+body {
+  max-width: 100% !important;
+  overflow-x: hidden !important;
+  width: 100% !important;
+}
+
+.recently-viewed-scroller {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.recently-viewed-scroller::-webkit-scrollbar {
+  display: none;
+  width: 0;
+  height: 0;
+}
+
+.home-below-fold > section,
+.home-below-fold > div {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 700px;
+}
+
+.product-card-deferred {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 450px;
+}

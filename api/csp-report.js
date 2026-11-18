@@ -1,0 +1,95 @@
+/**
+ * ============================================================
+ * CSP Violation Report Endpoint
+ * ============================================================
+ *
+ * Receives CSP violation reports from browsers and logs them.
+ * Endpoint: POST /api/csp-report
+ * Content-Type: application/csp-report
+ *
+ * التحديث: تم إضافة تنظيف دوري للذاكرة (Memory Cleanup)
+ * لمنع Memory Leak مع مرور الوقت.
+ * ============================================================
+ */
+
+import { getClientIp } from "./lib/request-ip.js";
+import { allowedOrigins } from "./lib/request-guards.js";
+import { createEndpointRateLimiter } from "./lib/endpoint-rate-limiter.js";
+
+const checkRateLimit = createEndpointRateLimiter({ windowMs: 60_000, max: 50 });
+
+// المعاينات/staging بـ 403 فيضيع أهم إنذار أمني في المشروع.
+const ALLOWED_ORIGINS = allowedOrigins();
+
+/**
+ * @param {import("express").Request} req
+ * @param {import("express").Response} res
+ */
+export default async function handler(req, res) {
+  const origin = req.headers.origin;
+  // Same-origin browser reports may omit Origin; when it is present, reject
+  // cross-origin callers instead of merely hiding the response with CORS.
+  if (origin && !ALLOWED_ORIGINS.has(origin)) return res.status(403).end();
+  const allowedOrigin = origin || "https://alikhlasmedical.store";
+  res.setHeader("Access-Control-Allow-Origin", allowedOrigin);
+  res.setHeader("Vary", "Origin");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("X-Robots-Tag", "noindex, nofollow, noarchive, nosnippet");
+  res.setHeader("Cache-Control", "no-store");
+
+  if (req.method === "OPTIONS") return res.status(204).end();
+  if (req.method !== "POST") return res.status(405).end();
+
+  const clientIp = getClientIp(req);
+
+  if (!checkRateLimit(clientIp)) {
+    return res.status(429).end();
+  }
+
+  try {
+    // 🔒 حد أقصى لحجم الـ body — يمنع استهلاك الذاكرة (DoS) وحشر سجلات ضخمة.
+    const rawBody = typeof req.body === "string" ? req.body : JSON.stringify(req.body ?? null);
+    if (Buffer.byteLength(rawBody, "utf8") > 4096) throw new Error("payload too large");
+
+    const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
+    // Support both legacy application/csp-report and the modern Reporting API
+    // application/reports+json array shape.
+    const report = body?.["csp-report"] ?? (Array.isArray(body) ? body[0]?.body : undefined);
+    if (!report || typeof report !== "object" || Array.isArray(report)) {
+      return res.status(400).end();
+    }
+    // 🔒 ساسنة الحقول قبل التسجيل — هذه القيم قادمة من المتصفح (قد يزوّرها مهاجم)
+    // لمنع Log Injection (حقن سطور/رموز تحكم في السجلات).
+    /** @param {unknown} s */
+    const sanitize = (s) =>
+      String(s ?? "")
+        .replace(/[\r\n\t\0]/g, " ")
+        .slice(0, 160);
+    // نُسقط query string من URIs قبل التسجيل: قد يحمل معاملات تتبع
+    // أو بيانات لا حاجة لحفظها في السجلات
+    const blockedUri = sanitize(report["blocked-uri"]).split("?")[0];
+    const directive = sanitize(report["violated-directive"]);
+    const documentUri = sanitize(report["document-uri"]).split("?")[0];
+    const scriptSample = sanitize(report["script-sample"]).slice(0, 100);
+
+    // Ignore noise (extensions injecting eval/inline)
+    if (blockedUri === "eval" || blockedUri === "inline") {
+      return res.status(200).end();
+    }
+
+    console.warn(`[csp-violation] ${directive} blocked ${blockedUri} on ${documentUri}`, {
+      type: "csp-violation",
+      timestamp: new Date().toISOString(),
+      blockedUri: blockedUri || "unknown",
+      directive: directive || "unknown",
+      document: documentUri || "unknown",
+      sample: scriptSample,
+    });
+
+    return res.status(200).end();
+  } catch (err) {
+    console.error("[csp-report] parse error:", err instanceof Error ? err.message : String(err));
+    return res.status(400).end();
+  }
+}

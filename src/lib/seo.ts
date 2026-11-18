@@ -1,0 +1,695 @@
+/**
+ * Helpers لإدارة الـ SEO على مستوى الـ SPA:
+ * - تحديث <title>, meta description, og tags, twitter, canonical
+ * - حقن JSON-LD (Schema.org)
+ */
+
+import { assetUrl } from "@/lib/cache";
+import { PRODUCT_META_PROFILES } from "@/data/product-meta";
+import {
+  getArchivedReviewSummary,
+  getProductReviews,
+  reviewDatePublished,
+  VISIBLE_REVIEW_COUNT,
+  type ProductCategory,
+} from "@/lib/legacy-product-reviews";
+import { GOVERNORATE_SHIPPING, getShippingDeliveryWindow } from "@/lib/site-config";
+
+// نفس منطق الـ prerender: يمكن ضبط الأصل وقت البناء عبر VITE_SITE_URL،
+// وإلا يبقى الدومين الرسمي.
+const SITE_URL = (
+  (import.meta.env?.VITE_SITE_URL as string | undefined) || "https://alikhlasmedical.store"
+).replace(/\/$/, "");
+
+/**
+ * يبني meta description بطول مثالي (~150-155 حرف) للظهور الكامل في نتائج Google.
+ * يقطع عند حدود كلمة ويضيف "…" عند الاقتطاع. يُستخدم للـ meta description فقط
+ * (الوصف الكامل يبقى في JSON-LD والمحتوى الفعلي).
+ */
+export function makeMetaDescription(text = "", maxLength = 155): string {
+  const clean = String(text).trim().replace(/\s+/g, " ");
+  if (clean.length <= maxLength) return clean;
+  const cut = clean.slice(0, maxLength);
+  const lastSpace = cut.lastIndexOf(" ");
+  const base = lastSpace > 40 ? cut.slice(0, lastSpace) : cut;
+  return `${base}…`;
+}
+
+/**
+ * Returns the product title for <title>/og:title.
+ *
+ * The limit only guards against runaway names: every catalog name (max 65
+ * chars) is emitted verbatim, so the prerendered HTML and the hydrated head
+ * show the identical, untruncated product name — Google decides display
+ * truncation itself.
+ */
+export function makeProductMetaTitle(name: string, maxLength = 70, titleLatin?: string): string {
+  const clean = String(name).trim().replace(/\s+/g, " ");
+  // يخلو الاسم من أي حروف لاتينية — أعلى الاستعلامات طلباً تبحث باللاتيني
+  // (kreva gel ~7.4k ظهور/شهر، dooz ~1.7k) والعنوان أقوى سطح لها. الميزانية
+  const suffix = titleLatin && !/[A-Za-z]/.test(clean) ? ` | ${titleLatin}` : "";
+  const budget = maxLength - suffix.length;
+  if (clean.length <= budget) return `${clean}${suffix}`;
+
+  const cut = clean.slice(0, Math.max(1, budget - 1));
+  const lastSpace = cut.lastIndexOf(" ");
+  let base = lastSpace > 20 ? cut.slice(0, lastSpace) : cut;
+  const openParen = base.lastIndexOf("(");
+  const closeParen = base.lastIndexOf(")");
+  if (openParen > closeParen && openParen > base.length - 28) {
+    base = base.slice(0, openParen).trimEnd();
+  }
+  return `${base.trimEnd()}…${suffix}`;
+}
+
+type ProductMetaCategory = "men" | "women" | "devices";
+
+type ProductMetaInput = {
+  id?: string;
+  name: string;
+  nameEn?: string;
+  category?: ProductMetaCategory;
+  description: string;
+  stock?: number;
+  price?: number;
+  rating?: number;
+  reviews?: number;
+  benefits?: string[];
+  ingredients?: string;
+  usage?: string;
+};
+
+type ResolvedProductMetaProfile = {
+  hook: string;
+  form: "oral" | "topical" | "device";
+};
+
+const TOPICAL_NAME_PATTERN =
+  /(?:^|[\s(،؛,:])(?:كريم|جل|بخاخ|رذاذ|مناديل|cream|gel|spray|wipes)(?=$|[\s)،؛,.:_-])/i;
+
+/**
+ * Product form is resolved from an explicit, reviewed profile keyed by the
+ * stable product id. The fallback deliberately looks only at the product name
+ * and category; ingredients/usage are not allowed to classify the product.
+ */
+function resolveProductMetaProfile(p: ProductMetaInput): ResolvedProductMetaProfile {
+  if (p.id && PRODUCT_META_PROFILES[p.id]) return PRODUCT_META_PROFILES[p.id];
+  if (p.category === "devices") return { form: "device", hook: "جهاز للاستخدام الشخصي" };
+  if (TOPICAL_NAME_PATTERN.test(`${p.name} ${p.nameEn ?? ""}`)) {
+    return { form: "topical", hook: "منتج موضعي للاستخدام الخارجي" };
+  }
+  if (p.category === "women") return { form: "oral", hook: "منتج للنساء بتركيبة عملية" };
+  return { form: "oral", hook: "مكمل غذائي للرجال" };
+}
+
+function productAudienceSuffix(p: ProductMetaInput, hook: string): string {
+  if (p.category === "devices") return "";
+  const context = `${p.name} ${p.nameEn ?? ""} ${hook}`;
+  if (
+    /للرجال|للنساء|للزوجين|for men|for women|for him|for her|\bman\b|\bwomen\b|\bmen\b/i.test(
+      context,
+    )
+  ) {
+    return "";
+  }
+  return p.category === "women" ? " للنساء" : " للرجال";
+}
+
+function compactPhrase(text: string, maxLength: number): string {
+  const clean = String(text).trim().replace(/\s+/g, " ");
+  if (clean.length <= maxLength) return clean;
+  const cut = clean.slice(0, maxLength);
+  const lastSpace = cut.lastIndexOf(" ");
+  return (lastSpace > 12 ? cut.slice(0, lastSpace) : cut).trimEnd();
+}
+
+function compactProductName(name: string, maxLength = 46): string {
+  const clean = String(name).trim().replace(/\s+/g, " ");
+  if (clean.length <= maxLength) return clean;
+
+  // Keep the Arabic product identity first; the English name remains in the
+  // title, visible product heading, and Product structured data.
+  const withoutEnglish = clean.replace(/\s*\([^)]*\)\s*$/, "").trim();
+  const candidate = withoutEnglish || clean;
+  if (candidate.length <= maxLength) return candidate;
+
+  const cut = candidate.slice(0, maxLength);
+  const lastSpace = cut.lastIndexOf(" ");
+  const trimmed = (lastSpace > 20 ? cut.slice(0, lastSpace) : cut).trimEnd();
+  // «(Red Bull) —: …». نشيل أي فاصل معلّق في الآخر قبل لصق النقطتين.
+  return trimmed.replace(/[\s—–\-،,·:]+$/u, "");
+}
+
+/**
+ * Keeps the catalog's raw first benefit wording, trimming only at a word
+ * boundary when the full snippet would exceed the meta-description budget.
+ */
+function compactRawBenefit(text: string, maxLength: number): string {
+  const clean = String(text).trim().replace(/\s+/g, " ");
+  if (clean.length <= maxLength) return clean;
+  if (maxLength <= 1) return "…";
+
+  const cut = clean.slice(0, maxLength - 1);
+  const lastSpace = cut.lastIndexOf(" ");
+  const base = lastSpace > 0 ? cut.slice(0, lastSpace) : cut;
+  return `${base.trimEnd()}…`;
+}
+
+/**
+ * Builds a product meta description from the catalog's raw first benefit when
+ * available. The benefit wording is not medically reviewed or rewritten here;
+ * it is only whitespace-normalized and clipped at a word boundary if needed.
+ */
+export function makeProductMetaDescription(p: ProductMetaInput, maxLength = 155): string {
+  // Owner-requested 17 August 2026 copy restoration, scoped to Kreva only.
+  // The historical page used the first 155 characters of its description.
+  if (p.id === "m-60") return makeMetaDescription(p.description, maxLength);
+
+  const profile = resolveProductMetaProfile(p);
+  const name = compactProductName(p.name);
+  const hook = `${profile.hook}${productAudienceSuffix(p, profile.hook)}`;
+  const brand = "الإخلاص ميديكال";
+  const hasApprovedStars = Boolean(
+    p.rating &&
+    p.reviews &&
+    Number.isFinite(p.rating) &&
+    p.rating >= 1 &&
+    p.rating <= 5 &&
+    Number.isInteger(p.reviews) &&
+    p.reviews >= 1,
+  );
+  const stars = hasApprovedStars ? `⭐${p.rating}/5 من ${p.reviews} تقييماً — ` : "";
+  const priceInline = p.price ? `، ${p.price} ج.م` : "";
+  const ship =
+    p.stock === 0 ? "غير متوفر حالياً — شحن سري عند التوفر." : "شحن سري ودفع عند الاستلام.";
+  const rawBenefit = p.benefits?.[0]?.trim().replace(/\s+/g, " ");
+
+  if (rawBenefit) {
+    const suffix = `${priceInline}. ${ship} ${brand}.`;
+    // Reserve enough room for a meaningful raw excerpt, then compact only the
+    // product name and benefit excerpt to keep the full template within 155.
+    const nameBudget = Math.max(1, Math.min(46, maxLength - stars.length - suffix.length - 26));
+    const benefitName = compactProductName(p.name, nameBudget);
+    const prefix = `${stars}${benefitName}: `;
+    const benefitBudget = maxLength - prefix.length - suffix.length;
+    const excerpt = compactRawBenefit(rawBenefit, benefitBudget);
+    const candidate = `${prefix}${excerpt}${suffix}`;
+    if (candidate.length <= maxLength) return candidate;
+  }
+
+  const variants = stars
+    ? [
+        `${stars}${name}: ${hook}${priceInline}. ${ship} ${brand}.`,
+        `${stars}${compactProductName(p.name, 36)}: ${compactPhrase(hook, 46)}${priceInline}. ${ship} ${brand}.`,
+        `${stars}${compactProductName(p.name, 28)}${priceInline}: ${compactPhrase(hook, 38)}. ${ship} ${brand}.`,
+        `${stars}${compactProductName(p.name, 22)}${priceInline}. ${ship} ${brand}.`,
+      ]
+    : [
+        `${hook} — ${name}${priceInline}. ${ship} ${brand}.`,
+        `${hook} — ${compactProductName(p.name, 34)}${priceInline}. ${ship} ${brand}.`,
+        `${compactPhrase(hook, 60)} — ${compactProductName(p.name, 26)}${priceInline}. ${ship} ${brand}.`,
+      ];
+
+  const complete = variants.find((variant) => variant.length <= maxLength);
+  if (complete) return complete;
+
+  // Keep the sentence complete even for a future unusually long product name.
+  return `${compactPhrase(hook, 50)}. ${ship} ${brand}.`;
+}
+const DEFAULT_OG = `${SITE_URL}/og-default.jpg`;
+
+function oneYearFromToday(): string {
+  return new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+}
+
+export function absoluteUrl(url?: string): string {
+  if (!url) return DEFAULT_OG;
+  if (/^https?:\/\//i.test(url)) return url;
+  return `${SITE_URL}${url.startsWith("/") ? url : `/${url}`}`;
+}
+
+/**
+ * Structured data + social previews use the plain absolute image URL.
+ *
+ * The cache-busting `?v=N` suffix belongs to on-page <img> tags only: adding it
+ * here made the hydrated og:image/Product schema disagree with the identical
+ * value the prerendered HTML already declares.
+ */
+function absoluteProductImage(url?: string): string {
+  if (!url) return DEFAULT_OG;
+  // نفس suffix كسر الكاش الذي يستخدمه الفيد والـ og:image في نسخة الـ prerender:
+  // عنوان صورة جديد يجبر جوجل على إعادة جلبها بدل الاعتماد على مصغّرة قديمة.
+  return absoluteUrl(assetUrl(url));
+}
+
+interface SeoMeta {
+  title?: string;
+  description?: string;
+  image?: string;
+  type?: "website" | "article" | "product";
+  noindex?: boolean;
+}
+
+function setMeta(selector: string, attr: string, value: string) {
+  let el = document.head.querySelector(selector) as HTMLMetaElement | null;
+  if (!el) {
+    el = document.createElement("meta");
+    const [, key, val] = selector.match(/\[(.+?)="(.+?)"\]/) ?? [];
+    if (key && val) el.setAttribute(key, val);
+    document.head.appendChild(el);
+  }
+  el.setAttribute(attr, value);
+}
+
+function setLink(rel: string, href: string) {
+  let el = document.head.querySelector(`link[rel="${rel}"]`) as HTMLLinkElement | null;
+  if (!el) {
+    el = document.createElement("link");
+    el.setAttribute("rel", rel);
+    document.head.appendChild(el);
+  }
+  el.setAttribute("href", href);
+}
+
+export function applySeo(meta: SeoMeta = {}) {
+  const path = typeof window !== "undefined" ? window.location.pathname : "/";
+  const url = `${SITE_URL}${path}`;
+  const title = meta.title ?? "الإخلاص ميديكال — متجر الصحة الزوجية بخصوصية كاملة";
+  const description =
+    meta.description ??
+    "متجر مصري للصحة الزوجية: وصف يذكر المكوّن والتحذير لكل منتج، تغليف محايد بلا اسم المنتج، دفع عند الاستلام، وشحن لكل المحافظات.";
+  const image = absoluteUrl(meta.image);
+
+  document.title = title;
+
+  setMeta('meta[name="description"]', "content", description);
+  // Use richer robots directive on indexable pages so Google can preview large images
+  // and longer snippets (better SERP CTR).
+  const robotsContent = meta.noindex
+    ? "noindex,follow,noarchive,nosnippet,noimageindex"
+    : "index,follow,max-image-preview:large,max-snippet:-1";
+  setMeta('meta[name="robots"]', "content", robotsContent);
+  // A Google-specific tag exists in the HTML template, so it must be updated too;
+  // otherwise it can override the general robots directive after SPA navigation.
+  setMeta('meta[name="googlebot"]', "content", robotsContent);
+
+  // Open Graph
+  setMeta('meta[property="og:title"]', "content", title);
+  setMeta('meta[property="og:description"]', "content", description);
+  setMeta('meta[property="og:type"]', "content", meta.type ?? "website");
+  setMeta('meta[property="og:url"]', "content", url);
+  setMeta('meta[property="og:image"]', "content", image);
+  setMeta(
+    'meta[property="og:locale"]',
+    "content",
+    // مع نسخة الـ prerender بعد الـ hydration (التكافؤ).
+    typeof document !== "undefined" && document.documentElement.lang === "en" ? "en_US" : "ar_EG",
+  );
+
+  // Twitter — البطاقة تتبع نسبة الصورة الحقيقية مطابقةً لنسخة الـ prerender
+  setMeta('meta[name="twitter:title"]', "content", title);
+  setMeta('meta[name="twitter:description"]', "content", description);
+  setMeta('meta[name="twitter:image"]', "content", image);
+  applyTwitterCardFor(image);
+
+  // Canonical
+  setLink("canonical", url);
+}
+
+/**
+ * نسبة الصور التي قِيست في هذه الجلسة — مفتاحها المسار **نسبياً**.
+ * قياس واحد لكل صورة في الجلسة يكفي: النسبة ثابتة لا تتغير.
+ * @type {Map<string, number>}
+ */
+const ogAspectCache = new Map();
+
+/**
+ * اختيار `twitter:card` من نسبة الصورة الفعلية.
+ *
+ * (`https://alikhlasmedical.store/...`). على أي نطاق غير الـ apex (www، دومين
+ * مخصص، Vercel Preview، localhost) يصبح الرابط cross-origin فتحجبه سياسة
+ * `img-src 'self'` — فيظهر CSP violation في الكونسول على **كل صفحة**
+ * (Lighthouse: errors-in-console + inspector-issues = 0) بلا أي فائدة.
+ * الحل: القياس بمسار نسبي (same-origin دائماً) + كاش للنسبة.
+ *
+ * @param {string} absoluteImage الرابط المطلق المستخدم في الميتا (يبقى كما هو).
+ */
+function applyTwitterCardFor(absoluteImage: string) {
+  /** @param {number} ratio */
+  const setCard = (ratio: number) => {
+    setMeta(
+      'meta[name="twitter:card"]',
+      "content",
+      ratio >= 1.4 ? "summary_large_image" : "summary",
+    );
+  };
+
+  const cached = ogAspectCache.get(absoluteImage);
+  if (cached !== undefined) {
+    setCard(cached);
+    return;
+  }
+  if (typeof Image === "undefined") return;
+
+  // مسار نسبي لنفس الأصل — يحافظ على القياس ويمنع حجب CSP.
+  const sameOriginSrc = absoluteImage.startsWith(SITE_URL)
+    ? absoluteImage.slice(SITE_URL.length) || "/"
+    : absoluteImage;
+  if (!sameOriginSrc.startsWith("/")) return; // صورة خارجية: البطاقة تبقى كما هي في الـ prerender
+
+  const probe = new Image();
+  probe.onload = () => {
+    const ratio =
+      probe.naturalWidth && probe.naturalHeight ? probe.naturalWidth / probe.naturalHeight : 2;
+    ogAspectCache.set(absoluteImage, ratio);
+    setCard(ratio);
+  };
+  probe.src = sameOriginSrc;
+}
+
+/**
+ * يحقن JSON-LD في <head> مع id محدد لتجنّب التكرار.
+ */
+export function injectJsonLd(id: string, data: Record<string, unknown>) {
+  const tagId = `ldjson-${id}`;
+  let el = document.getElementById(tagId) as HTMLScriptElement | null;
+  if (!el) {
+    el = document.createElement("script");
+    el.id = tagId;
+    el.type = "application/ld+json";
+    document.head.appendChild(el);
+  }
+  el.textContent = JSON.stringify(data);
+}
+
+export function clearJsonLd(id: string) {
+  document.getElementById(`ldjson-${id}`)?.remove();
+}
+
+/**
+ * يزيل سكربتات JSON-LD التي حُقنت وقت الـ prerender (data-prerender)
+ * حتى لا تتكرر مع النسخ التي يحقنها React بعد الـ hydration.
+ * تُستدعى مرة واحدة قبل injectJsonLd في صفحات المنتجات/المقالات/الفئات.
+ */
+export function clearPrerenderJsonLd() {
+  document
+    .querySelectorAll('script[type="application/ld+json"][data-prerender]')
+    .forEach((el) => el.remove());
+}
+
+// Schema builders جاهزة
+/** Merchant shipping bands generated from the same governorate config used at checkout. */
+export function merchantShippingDetails() {
+  type ShippingBand = {
+    rate: number;
+    regions: string[];
+    delivery: ReturnType<typeof getShippingDeliveryWindow>;
+  };
+
+  // Group by both price and delivery window so the schema cannot claim
+  // 1–5 days for Cairo/Giza when the customer-facing policy says 24–72 hours.
+  const byBand = new Map<string, ShippingBand>();
+  for (const entry of GOVERNORATE_SHIPPING) {
+    const delivery = getShippingDeliveryWindow(entry.name);
+    const key = `${entry.shipping}:${delivery.key}`;
+    const band = byBand.get(key) ?? { rate: entry.shipping, regions: [], delivery };
+    band.regions.push(entry.name);
+    byBand.set(key, band);
+  }
+
+  return [...byBand.values()].map(({ rate, regions, delivery }) => ({
+    "@type": "OfferShippingDetails",
+    shippingDestination: {
+      "@type": "DefinedRegion",
+      addressCountry: "EG",
+      addressRegion: regions,
+    },
+    shippingRate: {
+      "@type": "MonetaryAmount",
+      value: rate,
+      currency: "EGP",
+    },
+    deliveryTime: {
+      "@type": "ShippingDeliveryTime",
+      // The public promise is already a total delivery window. Keep handling
+      // at zero here so transitTime matches the visible 1–3 / 2–3 day range.
+      handlingTime: {
+        "@type": "QuantitativeValue",
+        minValue: 0,
+        maxValue: 0,
+        unitCode: "DAY",
+      },
+      transitTime: {
+        "@type": "QuantitativeValue",
+        minValue: delivery.minDays,
+        maxValue: delivery.maxDays,
+        unitCode: "DAY",
+      },
+    },
+  }));
+}
+
+export const productSchema = (p: {
+  id: string;
+  slug: string;
+  name: string;
+  nameEn?: string;
+  searchAliases?: string[];
+  brand?: string;
+  mpn?: string;
+  gtin?: string;
+  description: string;
+  price: number;
+  stock: number;
+  approvedReviewSummary?: { ratingValue: number; reviewCount: number };
+  category?: string;
+  image?: string;
+}) => {
+  // الـ markup يعكس المحتوى المرئي حرفياً: نفس دالة الاختيار الحتمية ونفس
+  // العدد الذي تعرضه واجهة React (مصدر وحيد VISIBLE_REVIEW_COUNT).
+  const reviewCategory: ProductCategory | null =
+    p.category === "men" || p.category === "women" || p.category === "devices" ? p.category : null;
+  // بلا أي `Review` في نفس الـ markup لو نسِي المستدعي تمرير الحقل.
+  // القاعدة الآن: وجود أرشيف **أو** ملخص مُمرَّر = هناك مراجعات تُعرض.
+  const archivedSummaryForVisibility = reviewCategory ? getArchivedReviewSummary(p.slug) : null;
+  const hasReviewSource = Boolean(archivedSummaryForVisibility || p.approvedReviewSummary);
+  const visibleReviews =
+    reviewCategory && hasReviewSource
+      ? getProductReviews(p.slug, reviewCategory, VISIBLE_REVIEW_COUNT).reviews
+      : [];
+  // (`product.rating` / `product.reviews`) — مصدر ثانٍ مستقل عن الأرشيف، يعطي
+  // `reviewCount` أكبر من عدد المراجعات المعروضة/المُعلَّمة في نفس الصفحة
+  // (11 مقابل 6 مثلاً) وهو ما يخالف سياسة Google بأن الـ markup يعكس المراجعات
+  // الفعلية للعنصر. الآن: الأرشيف هو المصدر، والدالة موجودة أصلاً
+  const archivedSummary = archivedSummaryForVisibility;
+  const ratingSummary = archivedSummary
+    ? { ratingValue: archivedSummary.rating, reviewCount: archivedSummary.reviewCount }
+    : p.approvedReviewSummary;
+  return {
+    "@context": "https://schema.org",
+    "@type": "Product",
+    name: p.name,
+    // Search aliases must stay in both copies (prerender + hydrated) so the
+    // initial HTML and the rendered DOM never declare different structured data.
+    // للألقاب العربية: استعلامات البراند اللاتيني («kreva gel»، «dooz»،
+    // «lady era»، «procomil»… ≈ 25 ألف ظهور/شهر في ملف طلبات البحث) لم يكن
+    // لها نص علامة لا في العنوان ولا في السكيما للمنتجات التي لا يحمل اسمها
+    // العربي العلامة. السكيما قناة آمنة بلا تغيير نص ظاهر ولا كسر تكافؤ.
+    ...(p.nameEn || p.searchAliases?.length
+      ? {
+          alternativeName: [...(p.nameEn ? [p.nameEn] : []), ...(p.searchAliases ?? [])],
+        }
+      : {}),
+    description: p.description,
+    sku: p.id,
+    // مطلوبان لبطاقة المنتج الغنية، وكانا غائبين عن كل المنتجات الـ91.
+    url: `${SITE_URL}/products/${p.slug}`,
+    ...(p.mpn?.trim() ? { mpn: p.mpn.trim() } : {}),
+    ...(p.gtin?.trim() ? { gtin: p.gtin.trim() } : {}),
+    image: absoluteProductImage(p.image),
+    ...(ratingSummary &&
+    Number.isFinite(ratingSummary.ratingValue) &&
+    ratingSummary.ratingValue >= 1 &&
+    ratingSummary.ratingValue <= 5 &&
+    Number.isInteger(ratingSummary.reviewCount) &&
+    ratingSummary.reviewCount >= 1
+      ? {
+          aggregateRating: {
+            "@type": "AggregateRating",
+            ratingValue: ratingSummary.ratingValue,
+            reviewCount: ratingSummary.reviewCount,
+            bestRating: 5,
+            worstRating: 1,
+          },
+        }
+      : {}),
+    ...(visibleReviews.length
+      ? {
+          review: visibleReviews.map((r) => ({
+            "@type": "Review",
+            author: { "@type": "Person", name: r.name },
+            ...(reviewDatePublished(r) ? { datePublished: reviewDatePublished(r) } : {}),
+            reviewBody: r.text,
+            reviewRating: {
+              "@type": "Rating",
+              ratingValue: r.rating,
+              bestRating: 5,
+              worstRating: 1,
+            },
+          })),
+        }
+      : {}),
+    offers: {
+      "@type": "Offer",
+      price: p.price,
+      priceCurrency: "EGP",
+      availability: p.stock > 0 ? "https://schema.org/InStock" : "https://schema.org/OutOfStock",
+      itemCondition: "https://schema.org/NewCondition",
+      url: `${SITE_URL}/products/${p.slug}`,
+      priceValidUntil: oneYearFromToday(),
+      validFrom: "2026-01-01",
+      hasMerchantReturnPolicy: {
+        "@type": "MerchantReturnPolicy",
+        applicableCountry: "EG",
+        returnPolicyCategory: "https://schema.org/MerchantReturnFiniteReturnWindow",
+        merchantReturnDays: 14,
+        returnMethod: "https://schema.org/ReturnByMail",
+        returnFees: "https://schema.org/ReturnFeesCustomerResponsibility",
+      },
+      shippingDetails: merchantShippingDetails(),
+    },
+    ...(p.brand?.trim() ? { brand: { "@type": "Brand", name: p.brand.trim() } } : {}),
+  };
+};
+
+export const articleSchema = (a: {
+  slug: string;
+  title: string;
+  excerpt: string;
+  category: string;
+  readMin: number;
+  image?: string;
+  author?: { name: string; role: string; credentials: string };
+  reviewer?: { name: string; role: string; credentials: string };
+  // الـ schema (JSON بيحذف undefined) — أفضل من تاريخ مزيف (Trust).
+  publishedAt: string;
+  updatedAt: string;
+  sources?: { title: string; url: string; publisher: string }[];
+}) => ({
+  "@context": "https://schema.org",
+  "@type": "Article",
+  headline: a.title,
+  description: a.excerpt,
+  image: absoluteUrl(a.image),
+  articleSection: a.category,
+  timeRequired: `PT${a.readMin}M`,
+  inLanguage: "ar-EG",
+  mainEntityOfPage: {
+    "@type": "WebPage",
+    "@id": `${SITE_URL}/education/${a.slug}`,
+  },
+  // (data-integrity بتتأكد منه) — و لو ناقص، الحقل بيختفي من الـ schema
+  datePublished: a.publishedAt,
+  dateModified: a.updatedAt,
+  author: {
+    "@type": "Organization",
+    "@id": `${SITE_URL}/about#editorial-team`,
+    name: a.author?.name ?? "فريق المحتوى الصحي — الإخلاص ميديكال",
+    description: a.author?.credentials,
+    url: `${SITE_URL}/about`,
+    parentOrganization: {
+      "@type": "Organization",
+      name: "الإخلاص ميديكال",
+      url: SITE_URL,
+    },
+  },
+  citation:
+    a.sources?.map((source) => ({
+      "@type": "CreativeWork",
+      name: source.title,
+      url: source.url,
+      publisher: { "@type": "Organization", name: source.publisher },
+    })) ?? [],
+  publisher: {
+    "@type": "Organization",
+    name: "الإخلاص ميديكال",
+    logo: {
+      "@type": "ImageObject",
+      url: `${SITE_URL}/logo.png`,
+    },
+  },
+});
+
+export const breadcrumbSchema = (items: { name: string; url: string }[]) => ({
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  itemListElement: items.map((it, i) => ({
+    "@type": "ListItem",
+    position: i + 1,
+    name: it.name,
+    item: `${SITE_URL}${it.url}`,
+  })),
+});
+
+/**
+ * FAQPage schema — تعليم آلي لأسئلة الصفحة وأجوبتها (أزواج Question/Answer).
+ *
+ * 7 مايو 2026** لكل المواقع (بعد حصرها في المواقع الحكومية/الصحية من أغسطس
+ * 2023)، وشالت الدعم من Rich Results Test وتقرير Search Console في يونيو
+ * 2026 ومن الـAPI في أغسطس 2026. فالسكيما **لا تُنتج أي مظهر مرئي في جوجل**
+ * ولا تُحسّن الـCTR — قيمتها الباقية أنها تجعل السؤال/الجواب قابلين للاستخراج
+ * لمحركات وأدوات أخرى (ومنها محركات الإجابة)، بشرط تطابقها حرفيًا مع النص
+ * المرئي في الصفحة. لذلك في صفحات المنتجات تُبنى من نفس مصدر النص المرئي
+ * (`getProductFAQs`)، وأي سؤال غير ظاهر للزائر = خطأ في التدقيق.
+ */
+export const faqSchema = (faqs: { question: string; answer: string }[]) => ({
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  mainEntity: faqs.map((f) => ({
+    "@type": "Question",
+    name: f.question,
+    acceptedAnswer: {
+      "@type": "Answer",
+      text: f.answer,
+    },
+  })),
+});
+
+/**
+ * ItemList schema — لصفحات الفئات (men/women/devices).
+ * يساعد Google يفهم أن الصفحة قائمة منتجات مرتبة.
+ */
+export const itemListSchema = (
+  items: { id?: string; name: string; slug: string; image?: string; price: number }[],
+  listName: string,
+) => {
+  return {
+    "@context": "https://schema.org",
+    "@type": "ItemList",
+    name: listName,
+    numberOfItems: items.length,
+    itemListElement: items.map((it, i) => ({
+      "@type": "ListItem",
+      position: i + 1,
+      url: `${SITE_URL}/products/${it.slug}`,
+      name: it.name,
+      image: it.image ? absoluteUrl(it.image) : undefined,
+    })),
+  };
+};
+
+/**
+ * الصفحة الحالية (نفس alternatesFor التي يستخدمها الـ prerender والـ sitemap)
+ * حتى لا تبقى روابط لغة قديمة بعد التنقل الداخلي، وتتطابق النسختان تماماً.
+ */
+export function applyHreflang(alternates: { lang: string; href: string }[]): void {
+  if (typeof document === "undefined") return;
+  document.querySelectorAll('link[rel="alternate"][hreflang]').forEach((n) => n.remove());
+  for (const a of alternates) {
+    const link = document.createElement("link");
+    link.rel = "alternate";
+    link.hreflang = a.lang;
+    link.href = absoluteUrl(a.href);
+    document.head.appendChild(link);
+  }
+}

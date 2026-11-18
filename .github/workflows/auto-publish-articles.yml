@@ -1,0 +1,87 @@
+name: 💎 Auto Publish Weekly Medical Article
+
+on:
+  schedule:
+    # Every Monday at 09:00 UTC — Cairo: 11:00 (winter, UTC+2) or 12:00 (summer, UTC+3).
+    # Egypt reinstated DST in 2023 (abolished in 2014) — the comment said "permanently UTC+2" which was wrong.
+    - cron: "0 9 * * 1"
+  workflow_dispatch:
+
+# Publishing is automatic after the full technical validation pipeline passes.
+permissions:
+  contents: write
+
+concurrency:
+  group: weekly-medical-article
+  cancel-in-progress: false
+
+jobs:
+  publish-article:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: 📥 Checkout main
+        uses: actions/checkout@v5
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: 🟢 Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: 📦 Install locked dependencies
+        run: npm ci --no-audit --prefer-offline
+
+      - name: 🤖 Generate medical article
+        run: node scripts/auto-generate-article.mjs
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+
+      - name: 🔗 Validate live trusted sources and claim support
+        run: npm run test:sources
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+
+      - name: 🧹 Format generated files
+        run: npm run format
+
+      - name: ✅ Run full technical validation
+        run: npm run ci
+        env:
+          SITE_URL: https://alikhlasmedical.store
+
+      - name: 🚀 Commit and publish to main
+        run: |
+          git config user.name "Al Ikhlas Medical Automation"
+          git config user.email "automation@alikhlasmedical.store"
+          # (2026-09-15) add محصور على مسارات المحتوى فقط — "git add ."
+          # كان هيقدر يدخل أي ملف معدّل غير مقصود (بما فيها
+          # google-apps-script.gs لو حد حط فيه سر يدويًا) في commit
+          # آلي. ملفات التوليد: src/data/articles.ts + public/images/
+          # + .generated-article-slug.
+          git add src/ public/ .generated-article-slug
+
+          if git diff --cached --quiet; then
+            echo "No article changes were generated."
+            exit 0
+          fi
+
+          git commit -m "content: publish weekly medical article"
+          # Rebase on any main updates that landed while validation was running.
+          git pull --rebase origin main
+          # Re-validate the FINAL (post-rebase) tree before it ships to main —
+          # the earlier 'npm run ci' validated a pre-rebase snapshot.
+          npm run ci
+          # (2026-09-15) safety net: لو الـ validation بعد الـ rebase ولّد
+          # generated files معدلة، نلتقطها صراحةً (نفس النطاق) بدل ما
+          # تروح main غير مسجلة — بدل افتراض أن الـ generation حتمية دائمًا.
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "Generated artifacts changed during post-rebase validation — committing them."
+            git add src/ public/ .generated-article-slug
+            git commit -m "content: sync generated artifacts after rebase"
+          fi
+          git push origin HEAD:main

@@ -1,0 +1,284 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    # فحص دوري أسبوعي (سبت 07:00 UTC) لكل مصادر المقالات — يفشل الووركفلو
+    # إذا وجد روابط ميتة حتى تُصلح قبل تراكمها (انظر check-source-links.mjs).
+    - cron: "0 7 * * 6"
+
+# Cancel previous runs on the same branch to save CI minutes
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: 24
+
+jobs:
+  # ─────────────────────────────────────────────────────────
+  # 0) Corpus source liveness — كل روابط المصادر في كل المقالات
+  #    (خط النشر التلقائي يفحص الجديد فقط؛ هذا يغطي الكوربوس كاملاً)
+  # ─────────────────────────────────────────────────────────
+  source-links:
+    name: 🔗 Corpus Source Liveness (all articles)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install locked dependencies
+        run: npm ci --no-audit --prefer-offline
+
+      - name: Check all article source URLs
+        run: node scripts/check-source-links.mjs
+
+  # ─────────────────────────────────────────────────────────
+  # 1) Static analysis — fast feedback before expensive jobs
+  # ─────────────────────────────────────────────────────────
+  static:
+    name: 🔍 Lint • Typecheck • Unit • Data Integrity
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # needed by schema validator + sitemap git log
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --no-audit --prefer-offline
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Data integrity tests
+        run: npm test
+
+      - name: Unit and API security tests
+        run: npm run test:unit
+
+  # ─────────────────────────────────────────────────────────
+  # Security audit — يفشل الـ run على أي ثغرة high/critical
+  # (يعتمد على الـ lockfile فقط: npm ci + npm audit)
+  # ─────────────────────────────────────────────────────────
+  audit:
+    name: 🛡 Security Audit (high+)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install locked dependencies
+        run: npm ci --no-audit --prefer-offline
+
+      - name: Audit (fail on high/critical)
+        run: npm audit --audit-level=high
+
+  # ─────────────────────────────────────────────────────────
+  # 2) Build — generates prerendered HTML, sitemaps, feeds
+  # ─────────────────────────────────────────────────────────
+  build:
+    name: 🏗 Build • Prerender • Sitemaps
+    runs-on: ubuntu-24.04
+    needs: static
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --no-audit --prefer-offline
+
+      - name: Build
+        env:
+          SITE_URL: https://alikhlasmedical.store
+        run: npm run build
+
+      # 🔍 Validate JSON-LD schemas AFTER build (requires the generated dist/)
+      - name: Validate JSON-LD schemas
+        run: node scripts/validate-schemas.mjs
+
+      - name: Generated artifact health check
+        run: npm run health-check
+
+      # 🔍 (2026-11-15 · Round 5) تدقيق SEO على dist/ — عناوين/أوصاف/كانونيكال/
+      # robots مقابل sitemap/JSON-LD/روابط ميتة/عناوين h1-h2/صور بلا alt.
+      # --strict يفشل الوظيفة على أي خطأ (التحذيرات لا تُفشل).
+      - name: SEO audit (dist)
+        run: npm run seo:audit:strict
+
+      # 🧪 (2026-11-15 · Round 6) تدقيق كتالوج المنتجات: السعر/المخزون/الصور/
+      # الـ slug/crossSell/سكيما Product/فيد التجّار/صفحات الأقسام.
+      - name: Product catalog audit
+        run: npm run product:audit:strict
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: dist
+          path: dist
+          # Preserve .well-known/security.txt when transferring dist to jobs.
+          include-hidden-files: true
+          retention-days: 7
+          if-no-files-found: error
+
+  # ─────────────────────────────────────────────────────────
+  # 3) Lighthouse — runs against the prerendered home page
+  # ─────────────────────────────────────────────────────────
+  lighthouse:
+    name: 🚦 Lighthouse Performance Budget
+    runs-on: ubuntu-24.04
+    needs: build
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --no-audit --prefer-offline
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: dist
+          path: dist
+
+      # 🚀 Serve dist/ via the real server (handles clean URLs like /products/men -> men.html)
+      - name: Serve dist/ (server/index.js)
+        run: |
+          PORT=8080 node server/index.js > /tmp/server.log 2>&1 &
+          # wait for server to be ready (check root returns 200)
+          for i in $(seq 1 15); do
+            if curl -sf -o /dev/null http://localhost:8080/; then break; fi
+            sleep 1
+          done
+          curl -sf -o /dev/null http://localhost:8080/products/men && echo "Server OK (clean URLs work)"
+          curl -fsS http://localhost:8080/.well-known/security.txt -o /tmp/security.txt
+          grep -q "Canonical: https://alikhlasmedical.store/.well-known/security.txt" /tmp/security.txt
+
+      - name: Run Lighthouse CI
+        uses: treosh/lighthouse-ci-action@v12
+        with:
+          configPath: .lighthouserc.json
+          uploadArtifacts: true
+          temporaryPublicStorage: false
+
+      - name: Fail build on budget errors
+        run: |
+          if [ -f "lighthouse-reports/lighthouse-summary.json" ]; then
+            node -e '
+              const s = require("./lighthouse-reports/lighthouse-summary.json");
+              if (s.failures && s.failures.length > 0) {
+                console.error("❌ Lighthouse budget failures:", s.failures);
+                process.exit(1);
+              }
+              console.log("✅ Lighthouse budgets passed");
+            '
+          fi
+
+  # ─────────────────────────────────────────────────────────
+  # 3b) Lighthouse Mobile — مراقبة أداء الموبايل (الأغلبية الحقيقية للزوار).
+  #     حدود الأداء warn فقط حتى تستقر خطوط الأساس الميدانية، لكن إخفاقات
+  #     الوصول/SEO/CLS أخطاء فاشلة مثل نسخة سطح المكتب.
+  # ─────────────────────────────────────────────────────────
+  lighthouse-mobile:
+    name: 🚦 Lighthouse Mobile Monitor
+    runs-on: ubuntu-24.04
+    needs: build
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --no-audit --prefer-offline
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: dist
+          path: dist
+
+      - name: Serve dist/ (server/index.js)
+        run: |
+          PORT=8080 node server/index.js > /tmp/server-mobile.log 2>&1 &
+          for i in $(seq 1 15); do
+            if curl -sf -o /dev/null http://localhost:8080/; then break; fi
+            sleep 1
+          done
+
+      - name: Run Lighthouse CI (mobile)
+        uses: treosh/lighthouse-ci-action@v12
+        with:
+          configPath: .lighthouserc.mobile.json
+          uploadArtifacts: true
+          temporaryPublicStorage: false
+
+  # ─────────────────────────────────────────────────────────
+  # 4) Browser checkout flow + real HTTP 404 behaviour
+  # ─────────────────────────────────────────────────────────
+  e2e:
+    name: 🧪 Browser Checkout Flow
+    runs-on: ubuntu-24.04
+    needs: build
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --no-audit --prefer-offline
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: dist
+          path: dist
+
+      - name: Install Chromium and system dependencies
+        run: npm run setup:e2e
+
+      - name: Run browser tests
+        run: npm run test:e2e

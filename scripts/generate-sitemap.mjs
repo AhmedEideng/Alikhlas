@@ -1,0 +1,931 @@
+import { createServer } from "vite";
+import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
+import { resolve, dirname } from "node:path";
+import { execSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { todayInCairo } from "./cairo-date.mjs";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const ROOT = resolve(__dirname, "..");
+const SITE_URL = (process.env.SITE_URL || "https://alikhlasmedical.store").replace(/\/$/, "");
+
+/** 📅 سقف الـlastmod: يوم البناء في توقيت القاهرة (لا UTC) — لا تواريخ مستقبلية. */
+const TODAY_IN_CAIRO = todayInCairo();
+
+/** 🗂️ رقم إصدار الكاش من المصدر المركزي الوحيد. */
+const { version: CACHE_VERSION } = JSON.parse(
+  readFileSync(resolve(ROOT, "config/cache-version.json"), "utf-8"),
+);
+
+/** مسار صورة مستقر للسitemaps (بلا ?v=): عناوين الصور المُرسلة لجوجل لا تتغير مع كل إصدار. */
+function stableImg(path) {
+  return String(path).split("?")[0];
+}
+
+/** يلحق رقم الإصدار بمسار صورة/أصل (يزيل أي ?v= قديم أولاً). */
+function assetUrl(path) {
+  const base = String(path).split("?")[0];
+  return `${base}?v=${CACHE_VERSION}`;
+}
+
+/**
+ *   1) git log (أدق إشارة، متاح في CI/Vercel).
+ *   2) config/content-dates.json — أثر (artifact) متتبَّع في المستودع،
+ *      يُحدَّث تلقائيًا كل بناء يرى git، ويُقرأ عندما لا يوجد git.
+ *   3) لا شيء → نحذف الوسم (لا نختلق تاريخًا).
+ *
+ * ليه؟ `.dockerignore` يستبعد `.git` (وصورة node:alpine بلا git أصلًا)، فكان
+ * **كل بناء Docker يُنتج sitemap بلا lastmod في 218 رابطًا من 282** — أي أن
+ * النشر الذاتي يفقد إشارة تحديث يعتمد عليها الزحف. القياس: 282 → 64 وسم.
+ */
+const CONTENT_DATES_PATH = resolve(ROOT, "config/content-dates.json");
+const DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+
+/** @type {Map<string, string | null>} */
+const gitDates = new Map();
+/** @type {Record<string, string> | null} */
+let artifactDates = null;
+/** @type {boolean | null} */
+let gitUsable = null;
+
+/** @returns {Record<string, string>} */
+function readContentDatesArtifact() {
+  try {
+    const parsed = JSON.parse(readFileSync(CONTENT_DATES_PATH, "utf-8"));
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+/** @returns {Record<string, string>} */
+function artifact() {
+  if (!artifactDates) artifactDates = readContentDatesArtifact();
+  return artifactDates;
+}
+
+/** @param {string} filePath @returns {string | null} */
+function getGitLastmod(filePath) {
+  if (gitDates.has(filePath)) return gitDates.get(filePath);
+  if (gitUsable === false) return null;
+  try {
+    const out = execSync(`git log -1 --format=%cs -- ${filePath}`, {
+      cwd: ROOT,
+      stdio: ["ignore", "pipe", "ignore"],
+      encoding: "utf-8",
+    }).trim();
+    gitUsable = true;
+    const date = DATE_PATTERN.test(out) ? out : null;
+    gitDates.set(filePath, date);
+    return date;
+  } catch {
+    // A shallow/non-Git deployment must not manufacture a lastmod date.
+    gitUsable = false;
+    return null;
+  }
+}
+
+// 🗓️ لا نضع lastmod إلا عندما نعرف آخر تعديل حقيقي للملف.
+// تاريخ البناء ليس تاريخ تعديل المحتوى؛ ترك الوسم غائباً أفضل من إرسال
+// إشارة زائفة تجعل Google تعيد الزحف بلا داعٍ أو تفقد الثقة في الإشارة.
+/** @param {string} filePath @returns {string | null} */
+function freshLastmod(filePath) {
+  const fromGit = getGitLastmod(filePath);
+  if (fromGit) return fromGit;
+  const fromArtifact = artifact()[filePath];
+  return fromArtifact && DATE_PATTERN.test(fromArtifact) ? fromArtifact : null;
+}
+
+/**
+ * حتى تستطيع أي بيئة بلا git (Docker) إنتاج sitemap كامل الإشارات.
+ */
+function persistContentDates() {
+  if (gitUsable !== true) {
+    const known = Object.keys(artifact()).length;
+    if (known === 0) {
+      console.warn(
+        "⚠️  git unavailable and config/content-dates.json is empty/missing — " +
+          "sitemap lastmod will be omitted (run a build with git, then commit the artifact).",
+      );
+    } else {
+      console.log(
+        `🗓  lastmod: git unavailable → using ${known} dates from config/content-dates.json`,
+      );
+    }
+    return;
+  }
+  /** @type {Record<string, string>} */
+  const merged = { ...artifact() };
+  let added = 0;
+  for (const [filePath, date] of gitDates) {
+    if (!date || merged[filePath] === date) continue;
+    merged[filePath] = date;
+    added += 1;
+  }
+  if (added === 0 && Object.keys(artifact()).length > 0) return;
+  const sorted = Object.fromEntries(Object.entries(merged).sort(([a], [b]) => a.localeCompare(b)));
+  writeFileSync(CONTENT_DATES_PATH, `${JSON.stringify(sorted, null, 2)}\n`, "utf-8");
+  console.log(`🗓  lastmod: wrote ${Object.keys(sorted).length} dates to config/content-dates.json`);
+}
+
+const esc = (s = "") =>
+  String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+
+async function generateSitemap() {
+  const vite = await createServer({
+    server: { middlewareMode: true },
+    appType: "custom",
+    optimizeDeps: { noDiscovery: true, include: [] },
+    plugins: [],
+    logLevel: "silent",
+  });
+
+  try {
+    // 1. جلب البيانات بشكل برمجي حقيقي بدلاً من الـ Regex
+    const { products } = await vite.ssrLoadModule("/src/data/products.ts");
+
+    // حفظ نسخة من الكتالوج كـ JSON للسيرفر للتحقق من الأسعار في الخلفية (Server-side Price Lookup)
+    const apiLibDir = resolve(ROOT, "api", "lib");
+    mkdirSync(apiLibDir, { recursive: true });
+    writeFileSync(
+      resolve(apiLibDir, "products-db.json"),
+      JSON.stringify(products, null, 2),
+      "utf-8",
+    );
+
+    // 🎁 خريطة الباقات المعتمدة للتحقق الخلفي من خصم الباقة (BUNDLE_DISCOUNT_RATE = 20%) في الخادم:
+    // نفس محرك cross-sell المستخدم في الواجهة → لا ازدواجية منطق.
+    const { getCrossSellsForProduct } = await vite.ssrLoadModule("/src/data/products.ts");
+    const bundlesDb = {};
+    for (const product of products) {
+      const suggestions = getCrossSellsForProduct(product)
+        .map((s) => s.id)
+        .filter((id) => id !== product.id);
+      if (suggestions.length > 0) bundlesDb[product.id] = [product.id, ...suggestions];
+    }
+    writeFileSync(
+      resolve(apiLibDir, "bundles-db.json"),
+      JSON.stringify(bundlesDb, null, 2),
+      "utf-8",
+    );
+
+    // حفظ إعدادات الشحن والعروض الترويجية المشتركة للسيرفر (Single Source of Truth)
+    const { GOVERNORATE_SHIPPING, FREE_SHIPPING_THRESHOLD } = await vite.ssrLoadModule(
+      "/src/lib/governorates.ts",
+    );
+    const { PROMO_TIERS } = await vite.ssrLoadModule("/src/lib/promo.ts");
+    const { BUNDLE_DISCOUNT_RATE } = await vite.ssrLoadModule("/src/lib/bundle-discount.ts");
+    // حفظ إعدادات الشحن والعروض الترويجية المشتركة للسيرفر (Single Source of Truth).
+    const configDb = {
+      GOVERNORATE_SHIPPING,
+      FREE_SHIPPING_THRESHOLD,
+      PROMO_TIERS,
+      BUNDLE_DISCOUNT_RATE,
+    };
+    writeFileSync(resolve(apiLibDir, "config-db.json"), JSON.stringify(configDb, null, 2), "utf-8");
+    const { isMerchantFeedExcluded } = await vite.ssrLoadModule("/src/lib/site-config.ts");
+    const { alternatesFor, enCategories } = await vite.ssrLoadModule("/src/data/en-pages.ts");
+    // Merchant فقط؛ الصفحات تبقى منشورة ومفهرسة. القاعدة في site-config.ts.
+    const catalogProducts = products.filter(
+      (p) => (p.stock ?? 0) > 0 && !isMerchantFeedExcluded(p),
+    );
+
+    let articles = [];
+    try {
+      const mod = await vite.ssrLoadModule("/src/data/articles.ts");
+      articles = mod.articles || [];
+    } catch {
+      /* لا مقالات — التوليد يكمل بلا أقسام المقالات */
+    }
+
+    // 🎴 بطاقات مقالات الـ homepage (ArticlesGrid) — module مولّد صغير من نفس
+    // المصدر (SSOT): الكروت الأربع التحويلية فقط، بلا حقل content/sources،
+    // عشان الـ chunk الكامل data-articles (~78KB) ما يدخلش المسار الحرج
+    // للـ homepage (نافذة الـ LCP). تغيير البطاقات = تعديل الـ slugs هنا + build.
+    const FEATURED_ARTICLE_SLUGS = [
+      "premature-ejaculation",
+      "vacuum-pump-complete-guide",
+      "womens-libido-boosters",
+      "device-maintenance-hygiene",
+    ];
+    const featuredCards = FEATURED_ARTICLE_SLUGS.flatMap((slug) => {
+      const a = articles.find((x) => x.slug === slug);
+      if (!a) {
+        console.warn(`⚠️ featured article slug not found in articles.ts: ${slug}`);
+        return [];
+      }
+      return [
+        {
+          slug: a.slug,
+          title: a.title,
+          excerpt: a.excerpt,
+          ...(a.image ? { image: a.image } : {}),
+          ...(a.imageAlt ? { imageAlt: a.imageAlt } : {}),
+          category: a.category,
+          readMin: a.readMin,
+          emoji: a.emoji,
+        },
+      ];
+    });
+    const cardsTs = [
+      "/**",
+      " * ⚙️ GENERATED FILE — `npm run build` (scripts/generate-sitemap.mjs).",
+      " * ⚠️ لا يُعدَّل يدوياً — عدّل src/data/articles.ts (أو قائمة الـ slugs في",
+      " *    السكربت) ثم أعِد البناء.",
+      " *",
+      " * بطاقات المقالات المعروضة في الـ homepage (ArticlesGrid): الحقول اللازمة",
+      " * فقط (بلا content/sources) حتى لا يدخل chunk data-articles الكامل في",
+      " * المسار الحرج.",
+      " */",
+      "export interface ArticleCard {",
+      "  slug: string;",
+      "  title: string;",
+      "  seoTitle?: string;",
+      "  excerpt: string;",
+      "  keyTakeaways?: string[];",
+      "  image?: string;",
+      "  imageAlt?: string;",
+      "  category: string;",
+      "  readMin: number;",
+      "  emoji: string;",
+      "}",
+      "",
+      `export const featuredArticleCards: ArticleCard[] = [`,
+      ...featuredCards.map((c) => {
+        const entries = Object.entries(c).map(([k, v]) => `    ${k}: ${JSON.stringify(v)}`);
+        return `  {\n${entries.join(",\n")},\n  },`;
+      }),
+      `];`,
+      "",
+      "/** عدد المقالات التوعوية إجمالاً (أرقام ديناميكية في الواجهة — بلا hardcode). */",
+      `export const ARTICLE_COUNT = ${articles.length};`,
+      "",
+    ].join("\n");
+    // نبقي الملفات Prettier-stable (بنفس إعدادات الـ repo: printWidth 100)
+    // عشان ما "تفلتشش" مع كل build ولا ترخص الـ lint.
+    const prettier = await import("prettier");
+    const prettierOpts = {
+      parser: "typescript",
+      printWidth: 100,
+      semi: true,
+      singleQuote: false,
+      trailingComma: "all",
+    };
+    const cardsOut = await prettier.format(cardsTs, prettierOpts);
+    writeFileSync(resolve(ROOT, "src/data/articles-cards.generated.ts"), cardsOut, "utf-8");
+
+    // ──  فصل مقالات: meta + body ──
+    // articles.ts هو مصدر الحقيقة (يتعدل يدويًا) — والمولّدين دول هما الوحيدين
+    // اللي الـ client بيستوردهم:
+    //  • articles-meta.generated.ts  → كل الـ 56 (بلا content/sources) — صفحات
+    //    القوائم/الروابط الداخلية (~20KB بدل 78KB).
+    //  • article-content.generated.ts → content + sources بس — صفحة المقال فقط.
+    // النتيجة: ما فيش أي client bundle فيه نص المقالات كلها.
+    const metaFields = (a) => {
+      const o = {
+        slug: a.slug,
+        title: a.title,
+        ...(a.seoTitle ? { seoTitle: a.seoTitle } : {}),
+        excerpt: a.excerpt,
+        ...(a.keyTakeaways?.length ? { keyTakeaways: a.keyTakeaways } : {}),
+        ...(a.image ? { image: a.image } : {}),
+        category: a.category,
+        readMin: a.readMin,
+        emoji: a.emoji,
+        author: a.author,
+        reviewer: a.reviewer,
+        ...(a.autoReviewed !== undefined ? { autoReviewed: a.autoReviewed } : {}),
+        publishedAt: a.publishedAt,
+        updatedAt: a.updatedAt,
+      };
+      return o;
+    };
+    const objLit = (o) =>
+      Object.entries(o)
+        .map(([k, v]) => `    ${k}: ${JSON.stringify(v)}`)
+        .join(",\n");
+    const metaTs = [
+      "/**",
+      " * ⚙️ GENERATED FILE — `npm run build` (scripts/generate-sitemap.mjs).",
+      " * ⚠️ لا يُعدَّل يدوياً — عدّل src/data/articles.ts ثم أعِد البناء.",
+      " *",
+      " * ميتاداتا كل المقالات (بلا content/sources) — للصفحات اللي بتعرض",
+      " * قوائم/روابط مقالات. صفحة التفاصيل بتجيب النصوص من",
+      " * article-content.generated.ts (chunk منفصل بيتحمل وقتها بس).",
+      " */",
+      "export interface ArticleMeta {",
+      "  slug: string;",
+      "  title: string;",
+      "  seoTitle?: string;",
+      "  excerpt: string;",
+      "  keyTakeaways?: string[];",
+      "  image?: string;",
+      "  imageAlt?: string;",
+      "  category: string;",
+      "  readMin: number;",
+      "  emoji: string;",
+      "  author: { name: string; role: string; credentials: string };",
+      "  reviewer: { name: string; role: string; credentials: string };",
+      "  autoReviewed?: boolean;",
+      "  publishedAt: string;",
+      "  updatedAt: string;",
+      "}",
+      "",
+      "export const articlesMeta: ArticleMeta[] = [",
+      ...articles.map((a) => `  {\n${objLit(metaFields(a))},\n  },`),
+      "];",
+      "",
+    ].join("\n");
+    const bodies = {};
+    for (const a of articles) {
+      bodies[a.slug] = { content: a.content, sources: a.sources };
+    }
+    const bodyTs = [
+      "/**",
+      " * ⚙️ GENERATED FILE — `npm run build` (scripts/generate-sitemap.mjs).",
+      " * ⚠️ لا يُعدَّل يدوياً — عدّل src/data/articles.ts ثم أعِد البناء.",
+      " *",
+      " * نصوص المقالات + مصادرها (أثقل جزء ~41KB+16KB) — بيتحمل بس في",
+      " * صفحة تفاصيل المقال، مش في القوائم ولا الـ homepage.",
+      " */",
+      "export interface ArticleBody {",
+      "  content: string;",
+      "  sources: { title: string; url: string; publisher: string }[];",
+      "}",
+      "",
+      "export const articleBodies: Record<string, ArticleBody> = {",
+      ...Object.entries(bodies).map(
+        ([slug, b]) => `  ${JSON.stringify(slug)}: {\n${objLit(b)},\n  },`,
+      ),
+      "};",
+      "",
+    ].join("\n");
+    writeFileSync(
+      resolve(ROOT, "src/data/articles-meta.generated.ts"),
+      await prettier.format(metaTs, prettierOpts),
+      "utf-8",
+    );
+    writeFileSync(
+      resolve(ROOT, "src/data/article-content.generated.ts"),
+      await prettier.format(bodyTs, prettierOpts),
+      "utf-8",
+    );
+
+    let seoLandingPages = [];
+    try {
+      const mod = await vite.ssrLoadModule("/src/data/landing-pages.ts");
+      seoLandingPages = mod.seoLandingPages || [];
+    } catch {
+      /* لا صفحات هبوط — التوليد يكمل بلا أقسامها */
+    }
+
+    // لمجرد .length! دلوقتي يستورد ملف عددين مولّد (~100 بايت).
+    {
+      // (~9KB) بدل استيراد landing-pages.ts (538KB) من الـ bundles.
+      // (TopicHub + روابط الموضوعات يحتاجوا عناوين الأدلة.)
+      const lines = [
+        "// AUTO-GENERATED by scripts/generate-sitemap.mjs — do not edit.",
+        "",
+        "/** عدد أدلة الـ SEO إجمالاً (رقم ديناميكي في الواجهة — بلا hardcode). */",
+        `export const SEO_LANDING_PAGE_COUNT = ${seoLandingPages.length};`,
+        "",
+        "/** ميتاداتا خفيفة لكل دليل (slug + title + noindex) — بلا نصوص. */",
+        "export interface LandingPageMeta {",
+        "  slug: string;",
+        "  title: string;",
+        "  description: string;",
+        "  primaryKeyword: string;",
+        "  updatedAt?: string;",
+        "  noindex?: boolean;",
+        "}",
+        "export const landingPagesMeta: LandingPageMeta[] = [",
+      ];
+      for (const p of seoLandingPages) {
+        lines.push(
+          `  { slug: ${JSON.stringify(p.slug)}, title: ${JSON.stringify(p.title)}, description: ${JSON.stringify(p.metaDescription ?? "")}, primaryKeyword: ${JSON.stringify(p.primaryKeyword ?? "")},${p.updatedAt ? ` updatedAt: ${JSON.stringify(p.updatedAt)},` : ""}${p.noindex ? " noindex: true," : ""} },`,
+        );
+      }
+      lines.push("];");
+      lines.push("");
+      const landingMetaOut = await prettier.format(lines.join("\n"), prettierOpts);
+      writeFileSync(
+        resolve(ROOT, "src/data/landing-pages-meta.generated.ts"),
+        landingMetaOut,
+        "utf-8",
+      );
+    }
+
+    const productLastmod =
+      [
+        freshLastmod("src/data/products.ts"),
+        freshLastmod("src/data/products/men.ts"),
+        freshLastmod("src/data/products/women.ts"),
+        freshLastmod("src/data/products/devices.ts"),
+      ]
+        .filter(Boolean)
+        .sort()
+        .pop() || null; // أحدث تعديل حقيقي لأي ملف من ملفات الكتالوج
+    const landingLastmod = freshLastmod("src/data/landing-pages.ts");
+
+    /**
+     * 📅 أحدث تاريخ محتوى مقال (إنشاء/تحديث) — مصدره بيانات المقالات نفسها
+     * لا ساعة جهاز البناء، فلا يظهر للفهرس تاريخ يخالف مقالاته.
+     */
+    const latestArticleDate =
+      articles
+        .map((a) => a.updatedAt || a.publishedAt)
+        .filter((d) => DATE_PATTERN.test(d || ""))
+        .sort()
+        .pop() || null;
+
+    const staticRoutes = [
+      {
+        path: "/",
+        priority: "1.0",
+        changefreq: "daily",
+        lastmod: freshLastmod("src/routes/index.tsx"),
+      },
+      {
+        path: "/products/men",
+        priority: "0.9",
+        changefreq: "weekly",
+        lastmod: freshLastmod("src/routes/products.men.tsx") || productLastmod,
+      },
+      {
+        path: "/products/women",
+        priority: "0.9",
+        changefreq: "weekly",
+        lastmod: freshLastmod("src/routes/products.women.tsx") || productLastmod,
+      },
+      {
+        path: "/products/devices",
+        priority: "0.9",
+        changefreq: "weekly",
+        lastmod: freshLastmod("src/routes/products.devices.tsx") || productLastmod,
+      },
+      {
+        path: "/education",
+        priority: "0.8",
+        changefreq: "weekly",
+        // 🔗 الفهرس يتغيّر عند إضافة مقال: نأخذ تاريخ أحدث مقال (تاريخ إنشائه
+        // أو آخر تعديل) بدل تاريخ commit لملف المسار، حتى لا يحمل الفهرس
+        // تاريخًا مختلفًا عن المقالات التي يعرضها.
+        lastmod: latestArticleDate || freshLastmod("src/routes/education.tsx"),
+      },
+      {
+        path: "/products/guides",
+        priority: "0.8",
+        changefreq: "weekly",
+        lastmod: landingLastmod,
+      },
+      {
+        path: "/about",
+        priority: "0.5",
+        changefreq: "monthly",
+        lastmod: freshLastmod("src/routes/about.tsx"),
+      },
+      {
+        path: "/contact",
+        priority: "0.6",
+        changefreq: "monthly",
+        lastmod: freshLastmod("src/routes/contact.tsx"),
+      },
+      {
+        path: "/medical-review-board",
+        priority: "0.5",
+        changefreq: "monthly",
+        lastmod: freshLastmod("src/routes/medical-review-board.tsx"),
+      },
+      {
+        path: "/shipping",
+        priority: "0.4",
+        changefreq: "yearly",
+        lastmod: freshLastmod("src/routes/shipping.tsx"),
+      },
+      {
+        path: "/returns",
+        priority: "0.4",
+        changefreq: "yearly",
+        lastmod: freshLastmod("src/routes/returns.tsx"),
+      },
+      {
+        path: "/terms",
+        priority: "0.3",
+        changefreq: "yearly",
+        lastmod: freshLastmod("src/routes/terms.tsx"),
+      },
+      {
+        path: "/privacy",
+        priority: "0.3",
+        changefreq: "yearly",
+        lastmod: freshLastmod("src/routes/privacy.tsx"),
+      },
+    ];
+
+    const urls = [
+      ...staticRoutes,
+      ...products.map((p) => ({
+        path: `/products/${p.slug}`,
+        priority: "0.8",
+        changefreq: "weekly",
+        lastmod: productLastmod,
+        image: p.image,
+        imageTitle: p.name,
+      })),
+      ...articles.map((a) => ({
+        path: `/education/${a.slug}`,
+        priority: "0.7",
+        changefreq: "monthly",
+        // لا نستخدم تاريخ commit للملف كله: تعديل مقال واحد لا يعني تعديل بقية المقالات.
+        lastmod: a.updatedAt || a.publishedAt || null,
+        image: a.image,
+        imageTitle: a.imageAlt ?? a.title,
+      })),
+      ...seoLandingPages
+        .filter((page) => !page.noindex)
+        .map((page) => ({
+          path: `/products/guides/${page.slug}`,
+          priority: "0.75",
+          changefreq: "monthly",
+          lastmod: landingLastmod,
+        })),
+    ];
+
+    // الصفحات المتقابلة الثمانية (xhtml:link امتداد مدعوم من جوجل).
+    urls.push(
+      {
+        path: "/en",
+        priority: "0.8",
+        changefreq: "weekly",
+        lastmod: freshLastmod("src/routes/en.index.tsx"),
+      },
+      ...enCategories.map((c) => ({
+        path: c.path,
+        priority: "0.8",
+        changefreq: "weekly",
+        lastmod: freshLastmod(`src/routes/en.products.${c.category}.tsx`),
+      })),
+    );
+    for (const u of urls) {
+      const al = alternatesFor(u.path);
+      if (al.length > 0) u.alternates = al;
+    }
+
+    // 2. بناء ملفات الـ XML
+    // ⚠️ ملاحظة هامة (قرار موثق): لا نضع أي search template في الـ sitemap.
+    // امتداد Yandex <search> (xmlns:search) بيعلّمه Google Search Console
+    // كـ "علامة XML غير صالحة" (error دائم في تقرير الـ sitemap — تأكد منه
+    // عمليًا في GSC). جوجل مش بتدعم search templates في الـ sitemaps أصلاً
+    // (امتداداتها: image/news/video/xhtml فقط) — "بحث الموقع" عند جوجل
+    // شغال عبر SearchAction في الـ JSON-LD الرئيسي (الصفحة الرئيسية) وهو
+    // نفس القالب /search?q={search_term_string}. الـ sitemap يبقى نظيف
+    // بوسوم مدعومة فقط.
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"
+        xmlns:image="http://www.google.com/schemas/sitemap-image/1.1"
+        xmlns:xhtml="http://www.w3.org/1999/xhtml">
+${urls
+  .map((u) => {
+    const imageBlock = u.image
+      ? `
+    <image:image>
+      <image:loc>${SITE_URL}${stableImg(u.image)}</image:loc>
+      <image:title>${esc(u.imageTitle)}</image:title>
+    </image:image>`
+      : "";
+    const altBlock =
+      Array.isArray(u.alternates) && u.alternates.length > 0
+        ? `\n${u.alternates
+            .map(
+              (a) =>
+                `    <xhtml:link rel="alternate" hreflang="${a.lang}" href="${SITE_URL}${a.href}" />`,
+            )
+            .join("\n")}`
+        : "";
+    // 🚫 لا نُرسل lastmod في المستقبل: ساعة جهاز البناء قد تتقدم على يوم
+    // الإنشاء الحقيقي، فيقرأ الزائر/جوجل تاريخًا مختلفًا. السقف = اليوم في القاهرة.
+    const cappedLastmod = u.lastmod && u.lastmod > TODAY_IN_CAIRO ? TODAY_IN_CAIRO : u.lastmod;
+    const lastmod = cappedLastmod ? `\n    <lastmod>${cappedLastmod}</lastmod>` : "";
+    return `  <url>
+    <loc>${SITE_URL}${u.path}</loc>${lastmod}
+    <changefreq>${u.changefreq}</changefreq>
+    <priority>${u.priority}</priority>${imageBlock}${altBlock}
+  </url>`;
+  })
+  .join("\n")}
+</urlset>
+`;
+
+    const articleImageEntries = articles
+      .filter((a) => a.image)
+      .map(
+        (a) => `  <url>
+    <loc>${SITE_URL}/education/${a.slug}</loc>
+    <image:image>
+      <image:loc>${SITE_URL}${stableImg(a.image)}</image:loc>
+      <image:title>${esc(a.title)}</image:title>
+      <image:caption>${esc(a.title)} — الإخلاص ميديكال</image:caption>
+    </image:image>
+  </url>`,
+      )
+      .join("\n");
+
+    const imageXml = `<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"
+        xmlns:image="http://www.google.com/schemas/sitemap-image/1.1">
+${products
+  .map(
+    (p) => `  <url>
+    <loc>${SITE_URL}/products/${p.slug}</loc>
+    <image:image>
+      <image:loc>${SITE_URL}${stableImg(p.image)}</image:loc>
+      <image:title>${esc(p.name)}</image:title>
+      <image:caption>${esc(p.name)} — الإخلاص ميديكال</image:caption>
+    </image:image>
+  </url>`,
+  )
+  .join("\n")}
+${articleImageEntries}
+</urlset>
+`;
+
+    const indexXml = `<?xml version="1.0" encoding="UTF-8"?>
+<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <sitemap>
+    <loc>${SITE_URL}/sitemap.xml</loc>
+  </sitemap>
+  <sitemap>
+    <loc>${SITE_URL}/sitemap-images.xml</loc>
+  </sitemap>
+</sitemapindex>
+`;
+
+    // 4. بناء ملفات الكتالوج (XML + CSV + TXT) للمنتجات المتاحة في المخزون
+    // 🛒 Google Merchant Center يطلب المكونات داخل الوصف.
+    // نضيف المكونات فقط إن لم تكن موجودة (منع تكرار النص).
+    // وصفات الاستخدام الموضعي بتزوّد إشارة "محتوى بالغين" في الـ feed، والتعليمات
+    // الكاملة بتفضل على صفحة المنتج (مصدر الحقيقة للزبون).
+    const buildFeedDescription = (p) => {
+      let fullDesc = (p.description || "").trim();
+      // بعض أوصاف الموقع التاريخية تحتوي على تعليمات الاستخدام في نهايتها.
+      // تبقى التعليمات كاملة في صفحة المنتج، لكن Merchant feed يجب أن يرسل
+      // وصفاً تجارياً نظيفاً لتقليل إشارات المحتوى البالغ/السياسات.
+      fullDesc = fullDesc.replace(/\s*طريقة الاستخدام\s*:[\s\S]*$/u, "").trim();
+      if (p.ingredients && !fullDesc.includes(p.ingredients)) {
+        fullDesc += " المكونات: " + p.ingredients;
+      }
+      // Google Merchant يقبل حتى 5000 حرف في الوصف
+      return fullDesc.slice(0, 5000);
+    };
+
+    // 🏷️ Google Product Category (official taxonomy IDs) — صادق لكل منتج:
+    // القيم IDs رسمية من taxonomy-with-ids.en-US.txt (stable/locale-independent).
+    const feedCategory = (p) => {
+      // أجهزة البالغين (مضخات/VED/جهاز شد) — التصنيف الصادق
+      // "Mature > Erotic > Sex Toys".
+      if (p.category === "devices") return "778";
+      const n = `${p.name} ${p.nameEn || ""}`;
+      // موضعي الأول (بخاخ/جل/كريم/مناديل) — عشان نصوص زي "with Vitamin E" في
+      // الـ nameEn ما تدفعش بخاخ لقائمة المكملات
+      if (/بخاخ|سبراي|سبراى|جل\b|جيل\b|كريم|مناديل|spray|\bgel\b|cream|wipes/i.test(n))
+        return "2915"; // Health & Beauty > Personal Care
+      if (/عسل|honey/i.test(n)) return "4947"; // Food Items > Condiments & Sauces > Honey
+      if (/شوكولاتة|شيكولاته|chocolate|علكة|\bgum\b|بنكهة/i.test(n)) return "4748"; // Food Items > Candy & Chocolate
+      if (/قهوة|coffee/i.test(n)) return "1868"; // Beverages > Coffee
+      // فمّي (كبسولات/أقراص/أكياس/قطرات فمّية)
+      if (/كبسول|أقراص|أكياس|قطرات|capsules?|tablets?|drops?|nutriceutical/i.test(n)) return "525"; // Fitness & Nutrition > Vitamins & Supplements
+      return "2915"; // fallback: Personal Care
+    };
+
+    // 🏷️ Product Type (تصنيف المتجر الداخلي لـ Merchant Center): يساعد Google
+    // على فهم بنية الكتالوج (قسم × شكل المنتج) بدل ترك التصنيف للتخمين وحده.
+    // نفس ترتيب كشف الشكل في feedCategory عشان التصنيفين ما يتناقضوش.
+    const feedProductType = (p) => {
+      const section =
+        p.category === "men"
+          ? "منتجات الرجال"
+          : p.category === "women"
+            ? "منتجات النساء"
+            : "أجهزة طبية";
+      if (p.category === "devices") return `${section} > أجهزة الصحة الزوجية`;
+      const n = `${p.name} ${p.nameEn || ""}`;
+      if (/بخاخ|سبراي|سبراى|جل\b|جيل\b|كريم|مناديل|spray|\bgel\b|cream|wipes/i.test(n))
+        return `${section} > منتجات موضعية`;
+      if (/عسل|honey/i.test(n)) return `${section} > عسل ملكي`;
+      if (/شوكولاتة|شيكولاته|chocolate|علكة|\bgum\b|بنكهة/i.test(n))
+        return `${section} > شوكولاتة وعلكات`;
+      if (/قهوة|coffee/i.test(n)) return `${section} > قهوة`;
+      if (/كبسول|أقراص|أكياس|قطرات|capsules?|tablets?|drops?|nutriceutical/i.test(n))
+        return `${section} > مكملات فموية`;
+      return `${section} > منتجات عناية`;
+    };
+
+    const feedRow = (p) => ({
+      id: p.id,
+      title: p.name,
+      description: buildFeedDescription(p),
+      link: `${SITE_URL}/products/${p.slug}`,
+      image_link: `${SITE_URL}${assetUrl(p.image)}`,
+      ...(p.brand?.trim() ? { brand: p.brand.trim() } : {}),
+      ...(p.gtin?.trim() ? { gtin: p.gtin.trim() } : {}),
+      ...(p.mpn?.trim() ? { mpn: p.mpn.trim() } : {}),
+      identifier_exists: p.gtin?.trim() || p.mpn?.trim() ? "yes" : "no",
+      condition: "new",
+      availability: p.stock > 0 ? "in stock" : "out of stock",
+      price: `${p.price} EGP`,
+      google_product_category: feedCategory(p),
+      product_type: feedProductType(p),
+    });
+
+    const catalogXml = `<?xml version="1.0" encoding="UTF-8"?>
+<rss xmlns:g="http://base.google.com/ns/1.0" version="2.0">
+  <channel>
+    <title>الإخلاص ميديكال - كتالوج المنتجات</title>
+    <link>${SITE_URL}</link>
+    <description>كتالوج منتجات الصحة والسعادة الزوجية الأصلية من الإخلاص ميديكال</description>
+${catalogProducts
+  .map((p) => {
+    const row = feedRow(p);
+    const optionalIdentifiers = [
+      row.brand ? `      <g:brand>${esc(row.brand)}</g:brand>` : "",
+      row.gtin ? `      <g:gtin>${esc(row.gtin)}</g:gtin>` : "",
+      row.mpn ? `      <g:mpn>${esc(row.mpn)}</g:mpn>` : "",
+    ]
+      .filter(Boolean)
+      .join("\n");
+    return `    <item>
+      <g:id>${esc(row.id)}</g:id>
+      <g:title>${esc(row.title)}</g:title>
+      <g:description>${esc(row.description)}</g:description>
+      <g:link>${row.link}</g:link>
+      <g:image_link>${row.image_link}</g:image_link>
+${optionalIdentifiers ? `${optionalIdentifiers}\n` : ""}      <g:identifier_exists>${row.identifier_exists}</g:identifier_exists>
+      <g:condition>${row.condition}</g:condition>
+      <g:availability>${row.availability}</g:availability>
+      <g:price>${row.price}</g:price>
+      <g:google_product_category>${esc(row.google_product_category)}</g:google_product_category>
+      <g:product_type>${esc(row.product_type)}</g:product_type>
+    </item>`;
+  })
+  .join("\n")}
+  </channel>
+</rss>
+`;
+
+    // CSV (متوافق مع Excel) وTXT (Tab-separated) — نفس المنتجات الوصف نفسه
+    // كانا يُولّدا يدوياً ويبتعدان عن الكتالوج؛ الآن جزء من البناء.
+    const FEED_COLUMNS = [
+      "id",
+      "title",
+      "description",
+      "link",
+      "image_link",
+      "brand",
+      "gtin",
+      "mpn",
+      "identifier_exists",
+      "condition",
+      "availability",
+      "price",
+      "google_product_category",
+      "product_type",
+    ];
+    const feedRows = catalogProducts.map(feedRow);
+    const csvEscape = (v) => {
+      const s = String(v ?? "");
+      return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+    };
+    // BOM UTF-8 في بداية الـ CSV حتى لا تتخرب العربية عند الفتح في Excel على
+    // Google Merchant يتعامل مع BOM في CSV بشكل قياسي؛ نستخدم أسطر LF ثابتة في artifacts.
+    const csvContent =
+      "\uFEFF" +
+      [
+        FEED_COLUMNS.join(","),
+        ...feedRows.map((row) => FEED_COLUMNS.map((c) => csvEscape(row[c])).join(",")),
+      ].join("\n") +
+      "\n";
+    const txtContent =
+      [
+        FEED_COLUMNS.join("\t"),
+        ...feedRows.map((row) =>
+          FEED_COLUMNS.map((c) => String(row[c] ?? "").replace(/[\t\r\n]+/g, " ")).join("\t"),
+        ),
+      ].join("\n") + "\n";
+
+    const robots = `# robots.txt — Al Ikhlas Medical
+# ${SITE_URL}
+
+User-agent: *
+Allow: /
+
+# Product pages and images must remain crawlable, including cache-versioned
+# image URLs (?v=) used by the storefront and Google Merchant product feed.
+User-agent: Googlebot
+Allow: /
+
+User-agent: Googlebot-Image
+Allow: /
+
+# ملاحظة: صفحات /cart و /wishlist و /order-confirmed و /thank-you تحمل وسم
+# noindex في HTML مباشرة. لذا لا نضعها في Disallow هنا — لأن منع الزحف
+# (Disallow) يمنع Google من قراءة وسم noindex، والتكرار بينهما غير مفيد.
+
+# Allow AI bots for AI Overviews, ChatGPT discovery, Perplexity, etc.
+User-agent: GPTBot
+Allow: /
+User-agent: ChatGPT-User
+Allow: /
+User-agent: Google-Extended
+Allow: /
+User-agent: PerplexityBot
+Allow: /
+User-agent: anthropic-ai
+Allow: /
+User-agent: Claude-Web
+Allow: /
+User-agent: CCBot
+Disallow: /
+User-agent: Bytespider
+Disallow: /
+
+Sitemap: ${SITE_URL}/sitemap-index.xml
+Sitemap: ${SITE_URL}/sitemap.xml
+Sitemap: ${SITE_URL}/sitemap-images.xml
+`;
+
+    const outDir = resolve(ROOT, "public");
+    mkdirSync(outDir, { recursive: true });
+    writeFileSync(resolve(outDir, "sitemap.xml"), xml, "utf-8");
+    writeFileSync(resolve(outDir, "sitemap-images.xml"), imageXml, "utf-8");
+    writeFileSync(resolve(outDir, "sitemap-index.xml"), indexXml, "utf-8");
+    // Merchant feed is a separate product source; it is intentionally not
+    // listed as a sitemap because catalog-feed.xml is RSS, not Sitemap XML.
+    writeFileSync(resolve(outDir, "catalog-feed.xml"), catalogXml, "utf-8");
+    writeFileSync(resolve(outDir, "catalog-feed.csv"), csvContent, "utf-8");
+    writeFileSync(resolve(outDir, "catalog-feed.txt"), txtContent, "utf-8");
+    writeFileSync(resolve(outDir, "robots.txt"), robots, "utf-8");
+
+    // ⚡ تحسين الأداء: توليد ملفات JSON فردية لكل Landing Page
+    // بدلاً من تحميل كل الـ 125 صفحة في bundle واحد 396KB
+    console.log("\n⚡ Generating individual landing page JSON files...");
+    const landingPagesDir = resolve(outDir, "landing-pages");
+    if (!existsSync(landingPagesDir)) mkdirSync(landingPagesDir, { recursive: true });
+
+    const mod2 = await vite.ssrLoadModule("/src/data/landing-pages.ts");
+    const allPages = mod2.seoLandingPages || [];
+
+    // أي landing page). يمنع بقاء صفحات محذوفة في public/ من تحديثات سابقة.
+    const { readdirSync, unlinkSync } = await import("node:fs");
+    const validSlugs = new Set(allPages.map((p) => p.slug));
+    for (const f of readdirSync(landingPagesDir)) {
+      if (f.endsWith(".json") && !validSlugs.has(f.replace(/\.json$/, ""))) {
+        unlinkSync(resolve(landingPagesDir, f));
+      }
+    }
+
+    for (const page of allPages) {
+      const safeData = {
+        slug: page.slug,
+        title: page.title,
+        metaTitle: page.metaTitle,
+        metaDescription: page.metaDescription,
+        eyebrow: page.eyebrow,
+        heroDescription: page.heroDescription,
+        intro: page.intro,
+        keyTakeaways: page.keyTakeaways,
+        sections: page.sections,
+        comparison: page.comparison,
+        links: page.links,
+        productIds: page.productIds,
+        faqs: page.faqs,
+        primaryKeyword: page.primaryKeyword,
+        relatedKeywords: page.relatedKeywords,
+        noindex: page.noindex,
+        sources: page.sources,
+        updatedAt: page.updatedAt,
+      };
+      writeFileSync(
+        resolve(landingPagesDir, `${page.slug}.json`),
+        JSON.stringify(safeData, null, 2),
+        "utf-8",
+      );
+    }
+    console.log(`   ✅ ${allPages.length} individual JSON files generated (${landingPagesDir})`);
+
+    // 🗓  حفظ/قراءة تواريخ آخر تعديل (يحل فقدان lastmod داخل Docker).
+    persistContentDates();
+    console.log(`✓ sitemaps generated successfully.`);
+  } finally {
+    await vite.close();
+  }
+}
+
+generateSitemap().catch((err) => {
+  console.error("Sitemap generation failed:", err);
+  process.exit(1);
+});

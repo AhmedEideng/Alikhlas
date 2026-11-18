@@ -1,0 +1,650 @@
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+
+import { expect, test } from "@playwright/test";
+
+import catalog from "../api/lib/products-db.json" with { type: "json" };
+import checkoutConfig from "../api/lib/config-db.json" with { type: "json" };
+import { productPageCopy } from "../src/data/product-page-copy";
+
+/**
+ * الرقم المتوقع في رابط واتساب — يُشتق من المصدر الوحيد (`VITE_WHATSAPP_NUMBER`)
+ * ولا يُكتب رقم في هذا الملف. السبب: كان مكتوبًا هنا الرقم البديل، فصار الاختبار
+ * يفشل بمجرد ضبط الرقم الحقيقي في `.env.production` (فشل حقيقي في أول تشغيل CI).
+ */
+function expectedWhatsAppNumber(): string {
+  const fromEnv = (process.env.VITE_WHATSAPP_NUMBER ?? "").replace(/\D/g, "");
+  if (fromEnv) return fromEnv;
+  const file = join(process.cwd(), ".env.production");
+  const fromFile = existsSync(file)
+    ? (readFileSync(file, "utf-8").match(/VITE_WHATSAPP_NUMBER\s*=\s*["']?(\d+)/)?.[1] ?? "")
+    : "";
+  if (!fromFile) {
+    throw new Error(
+      "تعذّر تحديد رقم واتساب للاختبار: اضبط VITE_WHATSAPP_NUMBER أو أبقِ .env.production موجودًا",
+    );
+  }
+  return fromFile;
+}
+
+const waUrlPattern = () => new RegExp(`wa\\.me/${expectedWhatsAppNumber()}`);
+
+test("customer can add a product, update quantity, calculate shipping and submit", async ({
+  page,
+}) => {
+  // Derive expectations from the catalog instead of freezing an old selling price.
+  const product = catalog.find((item) => item.id === "m-60");
+  if (!product) throw new Error("Kreva is missing from the checkout test catalog");
+  const quantity = 2;
+  const subtotalBeforeDiscount = product.price * quantity;
+  const tier = checkoutConfig.PROMO_TIERS.find((item) => subtotalBeforeDiscount >= item.threshold);
+  const discount = tier ? Math.round(subtotalBeforeDiscount * tier.discount) : 0;
+  const destination = checkoutConfig.GOVERNORATE_SHIPPING.find((item) => item.name === "القاهرة");
+  if (!destination) throw new Error("Cairo shipping is missing from checkout config");
+  const shipping =
+    subtotalBeforeDiscount >= checkoutConfig.FREE_SHIPPING_THRESHOLD ? 0 : destination.shipping;
+  const total = subtotalBeforeDiscount - discount + shipping;
+
+  let submittedPayload: Record<string, unknown> | undefined;
+  await page.route("**/api/submit-order", async (route) => {
+    submittedPayload = route.request().postDataJSON() as Record<string, unknown>;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ success: true, orderId: submittedPayload.orderId }),
+    });
+  });
+
+  await page.goto("/products/kreva-advanced-men-gel-50g");
+  await expect(page.getByRole("heading", { level: 1 })).toContainText("كريفا");
+  await page.getByRole("button", { name: "إضافة للسلة", exact: true }).click();
+
+  await page.goto("/cart");
+  await expect(page.getByText("جل كريفا", { exact: false }).first()).toBeVisible();
+  await page.getByRole("button", { name: /زيادة كمية جل كريفا/ }).click();
+
+  await page.getByRole("button", { name: /طلب مباشر/ }).click();
+  await page.getByPlaceholder("اكتب اسمك هنا").fill("عميل اختبار");
+  await page.getByPlaceholder("01xxxxxxxxx").fill("01012345678");
+  await page.locator("select").selectOption("القاهرة");
+  await page.getByPlaceholder("المدينة، الشارع، رقم العمارة").fill("القاهرة، شارع الاختبار 10");
+
+  await expect(page.getByText(`${total} ج.م`, { exact: true }).last()).toBeVisible();
+  await page.getByRole("button", { name: /تأكيد الطلب المباشر/ }).click();
+
+  await expect(page).toHaveURL(/\/order-confirmed$/);
+  expect(submittedPayload).toBeTruthy();
+  expect((submittedPayload!.items as Array<{ id: string; qty: number }>)[0]).toMatchObject({
+    id: "m-60",
+    qty: quantity,
+  });
+  expect(submittedPayload).toMatchObject({
+    governorate: "القاهرة",
+    subtotalBeforeDiscount,
+    discount,
+    shipping,
+    total,
+  });
+});
+
+test("every catalog product opens as a live page with structured data", async ({ baseURL }) => {
+  // لا روابط قديمة في المشروع: لكل منتج رابط واحد نهائي (slug) ومساره حيّ.
+  // (الاختبار السابق كان يتوقّع تحويلات 301 من مسارات /products/m-xx القديمة —
+  // وهي مسارات لا وجود لها في المشروع، فأُزيلت بالكامل.)
+  const slugs = catalog.map((item) => item.slug).filter((slug): slug is string => Boolean(slug));
+  expect(slugs.length).toBe(catalog.length);
+  for (const slug of slugs) {
+    const live = await fetch(`${baseURL}/products/${slug}`, { redirect: "manual" });
+    expect(live.status, slug).toBe(200);
+    expect(await live.text(), slug).toContain("application/ld+json");
+  }
+});
+
+test("education index serves 200 directly and slashed form 301s to it (Vercel parity)", async ({
+  baseURL,
+}) => {
+  // Vercel (trailingSlash:false) serves /education directly and 308s the
+  // slashed form. Self-hosted must match: no inverted slash redirect.
+  const direct = await fetch(`${baseURL}/education`, { redirect: "manual" });
+  expect(direct.status).toBe(200);
+  const slashed = await fetch(`${baseURL}/education/`, { redirect: "manual" });
+  expect(slashed.status).toBe(301);
+  expect(slashed.headers.get("location")).toBe("/education");
+});
+
+test("category URL search ?q filters products", async ({ page }) => {
+  await page.goto("/products/men?q=كريفا");
+  await expect(page.getByText("نتائج البحث عن: «كريفا»")).toBeVisible();
+  await expect(page.getByRole("link", { name: /جل كريفا/ }).first()).toBeVisible();
+  // a non-matching product must be filtered out of the grid
+  expect(await page.getByRole("link", { name: /هامر أوف ثور/ }).count()).toBe(0);
+  // clearing the search restores the full grid
+  await page.getByRole("link", { name: "مسح البحث" }).click();
+  await expect(page.getByRole("link", { name: /هامر أوف ثور/ }).first()).toBeVisible();
+  expect(await page.getByText(/نتائج البحث عن/).count()).toBe(0);
+});
+
+test("global search /search?q= filters products across all categories (SearchAction target)", async ({
+  page,
+}) => {
+  // The home JSON-LD SearchAction + sitemap search template target
+  // /search?q={search_term_string}
+  await page.goto("/search?q=هامر");
+  await expect(page.getByRole("heading", { name: "نتائج البحث عن: «هامر»" })).toBeVisible();
+  await expect(page.getByRole("link", { name: /هامر أوف ثور/ }).first()).toBeVisible();
+  // a women's product must not appear in the results
+  expect(await page.getByRole("link", { name: /ليدي إيرا/ }).count()).toBe(0);
+  // clearing the search restores the full catalog grid
+  await page.getByRole("link", { name: "مسح البحث" }).click();
+  await expect(page.getByRole("link", { name: /هامر أوف ثور/ }).first()).toBeVisible();
+  await expect(page.getByRole("link", { name: /ليدي إيرا/ }).first()).toBeVisible();
+  expect(await page.getByText(/نتائج البحث عن/).count()).toBe(0);
+});
+
+test("global search /search?q= shows empty state with category links", async ({ page }) => {
+  await page.goto("/search?q=zzzz-not-a-real-product-12345");
+  await expect(page.getByText(/لا توجد منتجات مطابقة/)).toBeVisible();
+  await expect(page.getByRole("link", { name: "منتجات رجالي" })).toBeVisible();
+  await expect(page.getByRole("link", { name: "منتجات نساء" })).toBeVisible();
+  // exact: الهيدر/الفوتر فيه روابط "الأجهزة الطبية" لمسار /products/devices
+  await expect(page.getByRole("link", { name: "الأجهزة", exact: true })).toBeVisible();
+});
+
+test("global search matches the Egyptian dialect 'نقط' to drops products", async ({ page }) => {
+  await page.goto("/search?q=نقط");
+  await expect(page.getByRole("heading", { name: "نتائج البحث عن: «نقط»" })).toBeVisible();
+  // منتجات القطرات (اسمها الرسمي «قطرات ...») تظهر للبحث المصري «نقط»
+  await expect(page.getByRole("link", { name: /قطرات ليدي إيرا/ }).first()).toBeVisible();
+  await expect(page.getByRole("link", { name: /قطرات كونيبال/ }).first()).toBeVisible();
+});
+
+test("live customer reviews section renders approved reviews from the API", async ({ page }) => {
+  await page.route("**/api/reviews*", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        reviews: [
+          {
+            name: "محمد",
+            rating: 5,
+            date: "1/8/2026",
+            text: "تجربة ممتازة والتغليف سري تماماً وصلني خلال يومين.",
+            verified: true,
+          },
+        ],
+        count: 1,
+      }),
+    }),
+  );
+  await page.goto("/products/hammer-of-thor-men-capsules");
+  await expect(page.getByText("تجارب عملاء حقيقية")).toBeVisible();
+  await expect(page.getByText(/تجربة ممتازة والتغليف سري/)).toBeVisible();
+  const liveSection = page
+    .locator("section")
+    .filter({ has: page.getByRole("heading", { name: "تجارب عملاء حقيقية" }) });
+  await expect(liveSection.getByText("شراء موثق")).toBeVisible();
+  await expect(page.getByText(/متوسط 1 مراجعة موثقة/)).toBeVisible();
+});
+
+test("reviews section hides the list when no approved reviews but keeps the form", async ({
+  page,
+}) => {
+  await page.route("**/api/reviews*", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ reviews: [], count: 0 }),
+    }),
+  );
+  await page.goto("/products/hammer-of-thor-men-capsules");
+  // النموذج متاح دائماً، لكن لا قائمة ولا متوسط بلا مراجعات معتمدة
+  await expect(page.getByText(productPageCopy.reviewTitle)).toBeVisible();
+  await expect(page.getByText(/مراجعة موثقة/)).toHaveCount(0);
+});
+
+test("customer review submission shows the pending-moderation confirmation", async ({ page }) => {
+  await page.route("**/api/reviews*", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ reviews: [], count: 0 }),
+    }),
+  );
+  const submittedBodies: string[] = [];
+  await page.route("**/api/submit-review", (route) => {
+    submittedBodies.push(route.request().postData() ?? "");
+    return route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ success: true, status: "pending" }),
+    });
+  });
+  await page.goto("/products/hammer-of-thor-men-capsules");
+  await page.getByText(productPageCopy.reviewTitle).scrollIntoViewIfNeeded();
+
+  await page.getByRole("radio", { name: "4 من 5 نجوم" }).click();
+  await page.getByPlaceholder("اسمك (اختياري)").fill("عميل اختبار");
+  await page.getByPlaceholder("01xxxxxxxxx").fill("01012345678");
+  await page
+    .getByPlaceholder(/اكتب تجربتك الصادقة/)
+    .fill("منتج ممتاز، وصلتني النتيجة اللي كنت متوقعها والتغليف سري تماماً.");
+  await page.getByRole("button", { name: "إرسال المراجعة" }).click();
+
+  await expect(page.getByText(/قيد المراجعة/)).toBeVisible();
+
+  // الـ payload: productId فقط — اسم المنتج يحدده السيرفر من الكتالوج المعتمد
+  const sent = JSON.parse(submittedBodies[0]);
+  expect(sent.productId).toBe("m-01");
+  expect(sent.rating).toBe(4);
+  expect(sent.reviewerName).toBe("عميل اختبار");
+  expect(sent.reviewerPhone).toBe("01012345678");
+  expect(sent).not.toHaveProperty("productName");
+});
+
+test("header live search links to the full /search results page", async ({ page }) => {
+  await page.goto("/");
+  await page.getByRole("button", { name: "بحث (Ctrl+K)" }).click();
+  const input = page.getByLabel("بحث في المنتجات");
+  await input.fill("عسل");
+  // dropdown يعرض اقتراحات + زر "عرض كل النتائج" بعداد حقيقي
+  const allBtn = page.getByRole("button", { name: /عرض كل النتائج في صفحة البحث \(\d+\)/ });
+  await expect(allBtn).toBeVisible();
+  await allBtn.click();
+  await expect(page).toHaveURL(/\/search\?q=/);
+  await expect(page.getByRole("heading", { name: "نتائج البحث عن: «عسل»" })).toBeVisible();
+});
+
+test("bundle button works once: second click goes to cart (no duplicate add)", async ({ page }) => {
+  await page.route("**/api/submit-order", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ success: true }),
+    });
+  });
+
+  await page.goto("/products/hammer-of-thor-men-capsules");
+  const addBtn = page.getByRole("button", { name: /أضف الباقة للسلة/ });
+  await expect(addBtn).toBeVisible();
+
+  // أول ضغط: إضافة واحدة فقط
+  await addBtn.click();
+  const addedBtn = page.getByRole("button", { name: /تمت الإضافة — اطلع على السلة/ });
+  await expect(addedBtn).toBeVisible();
+
+  // الزر لازم يفضل في حالة "مضاف" (ما يرجعش لـ"أضف" بعد 3 ثوانٍ زي ما كان)
+  await page.waitForTimeout(3500);
+  await expect(addedBtn).toBeVisible();
+  await expect(page.getByRole("button", { name: /أضف الباقة للسلة/ })).toHaveCount(0);
+
+  // الضغط التاني: ينتقل للسلة من غير ما يضيف نسخة ثانية
+  await addedBtn.click();
+  await expect(page).toHaveURL(/\/cart$/);
+
+  // كل منتجات الباقة بكمية 1 بالضبط: اسم هيمر أوف ثور يظهر مرة واحدة
+  await expect(page.getByText("هامر أوف ثور", { exact: false })).toHaveCount(1);
+});
+
+test("unknown routes return a real HTTP 404", async ({ request }) => {
+  const response = await request.get("/this-route-does-not-exist");
+  expect(response.status()).toBe(404);
+  expect(await response.text()).toContain("الصفحة غير موجودة");
+});
+
+test("failed direct order keeps the cart (no silent order loss)", async ({ page }) => {
+  let attempt = 0;
+  await page.route("**/api/submit-order", async (route) => {
+    attempt++;
+    if (attempt === 1) {
+      // First attempt: sheet is down (502)
+      await route.fulfill({
+        status: 502,
+        contentType: "application/json",
+        body: JSON.stringify({ error: "sheet down" }),
+      });
+    } else {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ success: true }),
+      });
+    }
+  });
+
+  await page.goto("/products/kreva-advanced-men-gel-50g");
+  await page.getByRole("button", { name: "إضافة للسلة", exact: true }).click();
+  await page.goto("/cart");
+  await page.getByRole("button", { name: /طلب مباشر/ }).click();
+  await page.getByPlaceholder("اكتب اسمك هنا").fill("عميل فشل");
+  await page.getByPlaceholder("01xxxxxxxxx").fill("01012345678");
+  await page.locator("select").selectOption("القاهرة");
+  await page.getByPlaceholder("المدينة، الشارع، رقم العمارة").fill("اختبار الفشل 1");
+  await page.getByRole("button", { name: /تأكيد الطلب المباشر/ }).click();
+
+  // Visible error + fallback channel, and the cart must NOT be lost
+  // Lenient window: the error toast depends on an unawaited fetch + render;
+  // slow CI runners need more headroom than the 5s default.
+  await expect(page.getByText(/تعذر تسجيل طلبك/)).toBeVisible({ timeout: 10_000 });
+
+  // Simulate leaving to WhatsApp (tab hidden) and coming back (visible):
+  // any toast that survived the suspension is stale and must be dismissed
+  // immediately by ToastCleanupOnVisible (this toast lives 10s, so only
+  // the guard can make it disappear this fast).
+  await page.evaluate(() => {
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      get: () => "hidden",
+    });
+    document.dispatchEvent(new Event("visibilitychange"));
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      get: () => "visible",
+    });
+    document.dispatchEvent(new Event("visibilitychange"));
+  });
+  await expect(page.getByText(/تعذر تسجيل طلبك/)).toBeHidden({ timeout: 4_000 });
+
+  await page.goto("/cart");
+  await expect(page.getByText("جل كريفا", { exact: false })).toBeVisible();
+
+  // Second attempt succeeds -> cart is cleared
+  // (governorate is form state — it resets on navigation, so re-select it)
+  await page.getByRole("button", { name: /طلب مباشر/ }).click();
+  await page.getByPlaceholder("اكتب اسمك هنا").fill("عميل فشل");
+  await page.getByPlaceholder("01xxxxxxxxx").fill("01012345678");
+  await page.locator("select").selectOption("القاهرة");
+  await page.getByPlaceholder("المدينة، الشارع، رقم العمارة").fill("اختبار الفشل 2");
+  await page.getByRole("button", { name: /تأكيد الطلب المباشر/ }).click();
+  await page.waitForTimeout(1500);
+  expect(attempt).toBe(2);
+});
+
+test("whatsapp cart order takes the customer straight to WhatsApp (same tab, no intermediate page)", async ({
+  page,
+}) => {
+  let orderCalls = 0;
+  await page.route("**/api/submit-order", (route) => {
+    orderCalls++;
+    return route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ success: true }),
+    });
+  });
+  // hermetic: نحتجز wa.me محلياً عشان ما نعتمدش على الشبكة الخارجية
+  await page.route("**/wa.me/**", (route) =>
+    route.fulfill({ status: 200, contentType: "text/html", body: "<html></html>" }),
+  );
+
+  await page.goto("/products/kreva-advanced-men-gel-50g");
+  await page.getByRole("button", { name: "إضافة للسلة", exact: true }).click();
+  await page.goto("/cart");
+  await page.getByPlaceholder("اكتب اسمك هنا").fill("عميل واتساب");
+  await page.getByPlaceholder("01xxxxxxxxx").fill("01012345678");
+  await page.locator("select").selectOption("القاهرة");
+  // واتساب هو الطريقة الافتراضية — الزر يدخل العميل واتساب مباشرة
+  await page.getByRole("button", { name: /تأكيد عبر واتساب/ }).click();
+
+  // نفس التبويب ينتقل لـ wa.me مباشرة — بلا صفحة وسيطة ولا زر تاني
+  await page.waitForURL(waUrlPattern(), { timeout: 10_000 });
+  const message = new URL(page.url()).searchParams.get("text") ?? "";
+  const krevaPrice = catalog.find((item) => item.id === "m-60")!.price;
+  expect(message).toContain(`عدد العبوات: 1\nسعر العبوة: ${krevaPrice} ج.م`);
+
+  // الطلب سُجّل فعلاً (sendBeacon وصل للـ API)
+  await page.waitForTimeout(100);
+  expect(orderCalls).toBe(1);
+});
+
+test("PDP quick WhatsApp order goes straight to WhatsApp in the same tab", async ({ page }) => {
+  let orderCalls = 0;
+  await page.route("**/api/submit-order", (route) => {
+    orderCalls++;
+    return route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ success: true }),
+    });
+  });
+  await page.route("**/wa.me/**", (route) =>
+    route.fulfill({ status: 200, contentType: "text/html", body: "<html></html>" }),
+  );
+
+  await page.goto("/products/kreva-advanced-men-gel-50g");
+  await page.getByRole("button", { name: /اطلب عبر واتساب/ }).click();
+  // الصفحة فيها حقل هاتف تاني (بار الطلب العائم) — نحدّد الحقل داخل المودال
+  const modal = page.getByRole("dialog", { name: "طلب سريع عبر واتساب" });
+  await modal.getByPlaceholder("اكتب اسمك").fill("عميل سريع");
+  await modal.getByPlaceholder("01xxxxxxxxx").fill("01012345678");
+  await modal.locator("select").selectOption("القاهرة");
+  await modal.getByRole("button", { name: /تسجيل وفتح واتساب/ }).click();
+
+  await page.waitForURL(waUrlPattern(), { timeout: 10_000 });
+  await page.waitForTimeout(100);
+  expect(orderCalls).toBe(1);
+});
+
+test("complete bundle applies the real 20% bundle discount (exclusive with tier) in cart and payload", async ({
+  page,
+}) => {
+  let submittedPayload: Record<string, unknown> | undefined;
+  await page.route("**/api/submit-order", async (route) => {
+    submittedPayload = route.request().postDataJSON() as Record<string, unknown>;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ success: true, orderId: submittedPayload?.orderId }),
+    });
+  });
+
+  // 🔒 التوقعات تُحسب من كتالوج المصدر (api/lib) وليس hardcoded:
+  // كسر CI — الحساب من المصدر يمنع تكرار ذلك لأي تحديث سعر مستقبلي.
+  const root0 = test.info().config.rootDir;
+  let base = root0;
+  while (!existsSync(join(base, "api", "lib", "products-db.json")) && base !== join(base, "..")) {
+    base = join(base, "..");
+  }
+  const readDb = (n: string) =>
+    JSON.parse(readFileSync(join(base, "api", "lib", n), "utf-8")) as Record<string, unknown>;
+  const products = readDb("products-db.json") as unknown as { id: string; price: number }[];
+  const bundles = readDb("bundles-db.json") as unknown as Record<string, string[]>;
+  const config = readDb("config-db.json") as unknown as {
+    BUNDLE_DISCOUNT_RATE: number;
+    FREE_SHIPPING_THRESHOLD: number;
+    GOVERNORATE_SHIPPING: { name: string; shipping: number }[];
+  };
+  const members = bundles["m-01"];
+  const priceOf = (id: string): number => {
+    const p = products.find((x) => x.id === id);
+    if (!p) throw new Error(`missing product in catalog: ${id}`);
+    return p.price;
+  };
+  const unitSum = members.reduce((s, id) => s + priceOf(id), 0);
+  const bundleDiscount = Math.round(unitSum * config.BUNDLE_DISCOUNT_RATE);
+  const subtotal = unitSum - bundleDiscount;
+  const shipping =
+    unitSum >= config.FREE_SHIPPING_THRESHOLD
+      ? 0
+      : (config.GOVERNORATE_SHIPPING.find((g) => g.name === "القاهرة")?.shipping ?? 0);
+  const total = subtotal + shipping;
+
+  await page.goto("/products/hammer-of-thor-men-capsules");
+  await page.getByRole("button", { name: /أضف الباقة للسلة/ }).click();
+  await page.waitForTimeout(1000);
+
+  await page.goto("/cart");
+  await expect(page.getByText("خصم الباقة المكتملة (20%)")).toBeVisible();
+  await expect(page.getByText(`-${bundleDiscount} ج.م`)).toBeVisible();
+  // خصم الشرائح يجب ألا يظهر (موقوف بسبب الباقة)
+  await expect(page.getByText(/خصم (?:10|15)%/)).toHaveCount(0);
+
+  await page.getByRole("button", { name: /طلب مباشر/ }).click();
+  await page.getByPlaceholder("اكتب اسمك هنا").fill("عميل باقة");
+  await page.getByPlaceholder("01xxxxxxxxx").fill("01012345678");
+  await page.locator("select").selectOption("القاهرة");
+  await page.getByPlaceholder("المدينة، الشارع، رقم العمارة").fill("اختبار الباقة 1");
+  await page.getByRole("button", { name: /تأكيد الطلب المباشر/ }).click();
+  await expect(page).toHaveURL(/\/order-confirmed$/);
+
+  expect(submittedPayload).toBeTruthy();
+  expect(submittedPayload).toMatchObject({
+    subtotalBeforeDiscount: unitSum,
+    discount: 0, // الشرائح موقوف — الباقة هي الخصم الوحيد
+    bundleDiscount, // خصم الباقة (20% من مجموع أعضاء الباقة)
+    subtotal,
+    shipping,
+    total,
+  });
+});
+
+test("retry after a lost order response and refresh retains the same order ID", async ({
+  page,
+}) => {
+  const ids: string[] = [];
+  await page.route("**/api/submit-order", async (route) => {
+    ids.push(route.request().postDataJSON().orderId);
+    if (ids.length === 1) return route.abort("connectionreset");
+    return route.fulfill({ json: { success: true } });
+  });
+  await page.goto("/products/kreva-advanced-men-gel-50g");
+  await page.getByRole("button", { name: "إضافة للسلة", exact: true }).click();
+  await page.goto("/cart");
+  const fill = async () => {
+    await page.getByRole("button", { name: /طلب مباشر/ }).click();
+    await page.getByPlaceholder("اكتب اسمك هنا").fill("عميل اختبار إعادة المحاولة");
+    await page.getByPlaceholder("01xxxxxxxxx").fill("01012345678");
+    await page.locator("select").selectOption("القاهرة");
+    await page.getByPlaceholder("المدينة، الشارع، رقم العمارة").fill("عنوان الاختبار المحلي");
+  };
+  await fill();
+  await page.getByRole("button", { name: /تأكيد الطلب المباشر/ }).click();
+  await expect(page.getByText(/تعذر تسجيل طلبك/)).toBeVisible();
+  await page.reload();
+  await fill();
+  await page.getByRole("button", { name: /تأكيد الطلب المباشر/ }).click();
+  await expect(page).toHaveURL(/order-confirmed/);
+  expect(ids).toHaveLength(2);
+  expect(ids[1]).toBe(ids[0]);
+  const stored = await page.evaluate(() => sessionStorage.getItem("ikhlas_pending_orders_v1"));
+  expect(stored).not.toContain("01012345678");
+  expect(stored).not.toContain(ids[0]);
+});
+
+test("oversized restored cart explains the 100-unit limit without sending an order", async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    localStorage.setItem(
+      "ikhlas_cart_v1",
+      JSON.stringify([
+        { id: "m-60", qty: 99 },
+        { id: "m-18", qty: 2 },
+      ]),
+    );
+  });
+  let requests = 0;
+  await page.route("**/api/submit-order", (route) => {
+    requests++;
+    return route.fulfill({ json: { success: true } });
+  });
+  await page.goto("/cart");
+  await expect(page.getByRole("alert").filter({ hasText: "سلّتك تحتوي على" })).toContainText("101");
+  await page.getByRole("button", { name: /طلب مباشر/ }).click();
+  await expect(page.getByRole("button", { name: /تأكيد الطلب المباشر/ })).toBeDisabled();
+  await expect(page.getByRole("button", { name: /زيادة كمية/ }).first()).toBeDisabled();
+  expect(requests).toBe(0);
+  await page
+    .getByRole("button", { name: /تقليل كمية/ })
+    .first()
+    .click();
+  await expect(page.getByRole("alert").filter({ hasText: "سلّتك تحتوي على" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /تأكيد الطلب المباشر/ })).toBeEnabled();
+});
+
+test("first category cards use eager images without an opacity loading gate", async ({ page }) => {
+  await page.goto("/products/men");
+  const cards = page.locator("main img[width='480'][height='480']");
+  await expect(cards.first()).toHaveAttribute("loading", "eager");
+  await expect(cards.nth(3)).toHaveAttribute("fetchpriority", "high");
+  await expect(cards.nth(4)).toHaveAttribute("loading", "lazy");
+  await expect(cards.first()).toHaveCSS("opacity", "1");
+});
+
+test("multi-product WhatsApp message keeps each quantity next to its explicit label", async ({
+  page,
+}) => {
+  await page.addInitScript(() =>
+    localStorage.setItem(
+      "ikhlas_cart_v1",
+      JSON.stringify([
+        { id: "m-18", qty: 2 },
+        { id: "m-60", qty: 3 },
+      ]),
+    ),
+  );
+  await page.route("**/api/submit-order", (route) => route.fulfill({ json: { success: true } }));
+  await page.route("**/wa.me/**", (route) =>
+    route.fulfill({ contentType: "text/html", body: "<html></html>" }),
+  );
+  await page.goto("/cart");
+  await page.getByPlaceholder("اكتب اسمك هنا").fill("عميل اختبار التنسيق");
+  await page.getByPlaceholder("01xxxxxxxxx").fill("01012345678");
+  await page.locator("select").selectOption("القاهرة");
+  await page.getByRole("button", { name: /تأكيد عبر واتساب/ }).click();
+  await page.waitForURL(waUrlPattern());
+  const message = new URL(page.url()).searchParams.get("text") ?? "";
+  for (const [id, qty] of [
+    ["m-18", 2],
+    ["m-60", 3],
+  ] as const) {
+    const price = catalog.find((item) => item.id === id)!.price;
+    expect(message).toContain(`عدد العبوات: ${qty}\nسعر العبوة: ${price} ج.م`);
+  }
+});
+
+test("Sotara 380 and Kreva 280 stay synchronized through page, schema, cart and checkout", async ({
+  page,
+  request,
+}) => {
+  const cases = [
+    { id: "m-31", slug: "sotara-men-gel-50g", price: 380 },
+    { id: "m-60", slug: "kreva-advanced-men-gel-50g", price: 280 },
+  ];
+  let payload: Record<string, unknown> | undefined;
+  await page.route("**/api/submit-order", async (route) => {
+    payload = route.request().postDataJSON();
+    await route.fulfill({ json: { success: true, orderId: payload!.orderId } });
+  });
+  for (const product of cases) {
+    expect(catalog.find((p) => p.id === product.id)?.price).toBe(product.price);
+    const response = await request.get(`/products/${product.slug}`);
+    expect(response.status()).toBe(200);
+    const html = await response.text();
+    const schemas = [
+      ...html.matchAll(/<script[^>]*type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/g),
+    ].map((m) => JSON.parse(m[1]));
+    expect(Number(schemas.find((s) => s["@type"] === "Product").offers.price)).toBe(product.price);
+    await page.goto(`/products/${product.slug}`);
+    await expect(page.locator("script#ldjson-product")).toBeAttached();
+    const schema = JSON.parse((await page.locator("script#ldjson-product").textContent())!);
+    expect(Number(schema.offers.price)).toBe(product.price);
+    await expect(page.getByText(`${product.price} ج.م`, { exact: true }).first()).toBeVisible();
+    await page.getByRole("button", { name: "إضافة للسلة", exact: true }).click();
+  }
+  await page.goto("/cart");
+  await page.getByRole("button", { name: /طلب مباشر/ }).click();
+  await page.getByPlaceholder("اكتب اسمك هنا").fill("اختبار السعر");
+  await page.getByPlaceholder("01xxxxxxxxx").fill("01012345678");
+  await page.locator("select").selectOption("القاهرة");
+  await page.getByPlaceholder("المدينة، الشارع، رقم العمارة").fill("القاهرة، عنوان اختبار محلي");
+  await page.getByRole("button", { name: /تأكيد الطلب المباشر/ }).click();
+  await expect(page).toHaveURL(/\/order-confirmed$/);
+  expect(payload?.subtotalBeforeDiscount).toBe(660);
+  expect(payload?.items).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ id: "m-31", qty: 1 }),
+      expect.objectContaining({ id: "m-60", qty: 1 }),
+    ]),
+  );
+});
