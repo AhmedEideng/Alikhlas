@@ -1,0 +1,314 @@
+@import "tailwindcss" source(none);
+@source "../src";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --radius-2xl: calc(var(--radius) + 8px);
+  --radius-3xl: calc(var(--radius) + 12px);
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary-glow: var(--primary-glow);
+  --color-gold: var(--gold);
+  --color-gold-soft: var(--gold-soft);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-success: var(--success);
+  --color-success-foreground: var(--success-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --font-sans: "Cairo", "Cairo Fallback", system-ui, sans-serif;
+  --font-display: "Cairo", "Cairo Fallback", system-ui, sans-serif;
+}
+
+/* ============================================================
+ * Color tokens with sRGB fallbacks for old browsers (Chrome <111,
+ * Safari <15.4, Windows 7). Each token has hex/rgba first, then
+ * the modern oklch(). Old browsers ignore the second declaration.
+ * Royal Emerald Green & Luxury Gold Identity — Al Ikhlas Medical
+ * ============================================================ */
+:root {
+  --radius: 1rem;
+
+  --background: #f3fbf6;
+  --background: oklch(0.985 0.016 158);
+  --foreground: #08251a;
+  --foreground: oklch(0.2 0.04 158);
+
+  --card: #ffffff;
+  --card: oklch(1 0 0);
+  --card-foreground: #071f13;
+  --card-foreground: oklch(0.18 0.04 155);
+
+  --popover: #ffffff;
+  --popover: oklch(1 0 0);
+  --popover-foreground: #071f13;
+  --popover-foreground: oklch(0.18 0.04 155);
+
+  --primary: #0c7a42;
+  --primary: oklch(0.5 0.13 158);
+  --primary-foreground: #ffffff;
+  --primary-foreground: oklch(1 0 0);
+  --primary-glow: #e9b62c;
+  --primary-glow: oklch(0.78 0.16 84);
+
+  /* ── إطار ذهبي لصور المنتجات (بدل الحدّ الزمردي) ── */
+  --gold: #e3ac21;
+  --gold-soft: #e8c473;
+  --gold-bright: #ffd977;
+  --gold-ink: #8f6508;
+
+  --secondary: #e4f8ec;
+  --secondary: oklch(0.965 0.035 158);
+  --secondary-foreground: #08381f;
+  --secondary-foreground: oklch(0.28 0.06 155);
+
+  --muted: #e8f6ee;
+  --muted: oklch(0.95 0.025 158);
+  --muted-foreground: #3b5848;
+  --muted-foreground: oklch(0.44 0.04 155);
+
+  --accent: #fdf0cd;
+  --accent: oklch(0.96 0.05 88);
+  --accent-foreground: #08381f;
+  --accent-foreground: oklch(0.28 0.06 155);
+
+  --destructive: #ea0000;
+  --destructive: oklch(0.55 0.28 27);
+  --destructive-foreground: #ffffff;
+  --destructive-foreground: oklch(1 0 0);
+
+  --success: #0e8a4c;
+  --success: oklch(0.56 0.14 158);
+  --success-foreground: #ffffff;
+  --success-foreground: oklch(1 0 0);
+
+  --border: #cfe8d9;
+  --border: oklch(0.915 0.028 158);
+  --input: #d8ecdf;
+  --input: oklch(0.93 0.025 158);
+  --ring: rgba(12, 122, 66, 0.38);
+  --ring: oklch(0.5 0.13 158 / 0.38);
+
+  --gradient-hero: linear-gradient(135deg, #07552c 0%, #0c8a49 55%, #e3ac21 100%);
+  --gradient-hero: linear-gradient(
+    135deg,
+    oklch(0.4 0.11 158) 0%,
+    oklch(0.57 0.14 158) 55%,
+    oklch(0.78 0.15 84) 100%
+  );
+
+  --gradient-soft: linear-gradient(180deg, #eefaf2 0%, #ffffff 100%);
+  --gradient-soft: linear-gradient(180deg, oklch(0.975 0.028 158) 0%, oklch(1 0 0) 100%);
+
+  --gradient-brand: linear-gradient(135deg, #0a6b3c, #0e9455);
+  --gradient-brand: linear-gradient(135deg, oklch(0.47 0.13 158), oklch(0.6 0.15 158));
+
+  --shadow-sm: 0 2px 6px rgba(6, 76, 42, 0.06);
+  --shadow-sm: 0 2px 6px oklch(0.25 0.1 158 / 0.06);
+  --shadow-md: 0 16px 32px -12px rgba(6, 80, 44, 0.16);
+  --shadow-md: 0 16px 32px -12px oklch(0.25 0.12 158 / 0.16);
+  --shadow-lg: 0 30px 60px -16px rgba(6, 80, 44, 0.26);
+  --shadow-lg: 0 30px 60px -16px oklch(0.25 0.14 158 / 0.26);
+  --shadow-glow: 0 0 44px rgba(233, 182, 44, 0.38);
+  --shadow-glow: 0 0 44px oklch(0.78 0.16 84 / 0.38);
+
+  --transition-smooth: all 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.dark {
+  --background: #04120b;
+  --background: oklch(0.14 0.03 155);
+  --foreground: #f4faf6;
+  --foreground: oklch(0.98 0.005 155);
+  --card: #081e13;
+  --card: oklch(0.18 0.04 155);
+  --primary: #d4a017;
+  --primary: oklch(0.74 0.15 82);
+  --primary-foreground: #04120b;
+  --primary-foreground: oklch(0.14 0.03 155);
+  --border: rgba(255, 255, 255, 0.08);
+  --border: oklch(1 0 0 / 0.08);
+  --gold: #e6b83a;
+  --gold-soft: #a8842c;
+  --destructive: #ff0000;
+  --destructive: oklch(0.65 0.3 27);
+}
+
+@layer base {
+  *,
+  *::before,
+  *::after {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+  }
+
+  html {
+    direction: rtl;
+    overflow-x: hidden;
+    max-width: 100%;
+  }
+
+  body {
+    overflow-x: hidden;
+    max-width: 100%;
+  }
+
+  * {
+    border-color: var(--color-border);
+  }
+  body {
+    background-color: var(--color-background);
+    color: var(--color-foreground);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+  }
+  h1,
+  h2,
+  h3,
+  h4 {
+    font-weight: 800;
+    letter-spacing: -0.02em;
+  }
+}
+
+@layer utilities {
+  .bg-gradient-brand {
+    background-image: var(--gradient-brand);
+  }
+  .shadow-card {
+    box-shadow: var(--shadow-md);
+  }
+  .transition-smooth {
+    transition: var(--transition-smooth);
+  }
+
+  /* ── أشرطة ضوء متناظرة بين أقسام الرئيسية ──
+     تمنح الصفحة إيقاعًا بدل سطح أبيض واحد مسطّح. تدرّج خفيف جدًا
+     (نفس عائلة لون العلامة) فلا يشتّت عن المحتوى. */
+  .home-band-mint {
+    background-image: var(--gradient-soft);
+  }
+  .home-band-cream {
+    background-image: linear-gradient(180deg, #fffdf6 0%, #ffffff 100%);
+  }
+
+  .skeleton {
+    overflow: hidden;
+    background-color: #e6efe9;
+    background-color: oklch(0.94 0.012 155);
+  }
+  .skeleton::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    transform: translateX(-100%);
+    background-image: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.4), transparent);
+    animation: shimmer 2s infinite linear;
+  }
+}
+
+/* ============================================================
+ * Hard fallback for browsers that don't support oklch() at all.
+ * ============================================================ */
+@supports not (color: oklch(0% 0 0)) {
+  :root {
+    --background: #f3fbf6;
+    --foreground: #08251a;
+    --card: #ffffff;
+    --card-foreground: #071f13;
+    --popover: #ffffff;
+    --popover-foreground: #071f13;
+    --primary: #0c7a42;
+    --primary-foreground: #ffffff;
+    --primary-glow: #e9b62c;
+    --secondary: #e4f8ec;
+    --secondary-foreground: #08381f;
+    --muted: #e8f6ee;
+    --muted-foreground: #3b5848;
+    --accent: #fdf0cd;
+    --accent-foreground: #08381f;
+    --destructive: #ea0000;
+    --destructive-foreground: #ffffff;
+    --success: #0e8a4c;
+    --success-foreground: #ffffff;
+    --border: #cfe8d9;
+    --input: #d8ecdf;
+    --ring: rgba(12, 122, 66, 0.38);
+    --gradient-hero: linear-gradient(135deg, #07552c 0%, #0c8a49 55%, #e3ac21 100%);
+    --gradient-soft: linear-gradient(180deg, #eefaf2 0%, #ffffff 100%);
+    --gradient-brand: linear-gradient(135deg, #0a6b3c, #0e9455);
+    --shadow-sm: 0 2px 6px rgba(6, 76, 42, 0.06);
+    --shadow-md: 0 16px 32px -12px rgba(6, 80, 44, 0.16);
+    --shadow-lg: 0 30px 60px -16px rgba(6, 80, 44, 0.26);
+    --shadow-glow: 0 0 44px rgba(233, 182, 44, 0.38);
+  }
+
+  .dark {
+    --background: #04120b;
+    --foreground: #f4faf6;
+    --card: #081e13;
+    --primary: #d4a017;
+    --primary-foreground: #04120b;
+    --border: rgba(255, 255, 255, 0.08);
+    --destructive: #ff0000;
+  }
+
+  .skeleton {
+    background-color: #e6efe9;
+  }
+}
+
+@keyframes shimmer {
+  100% {
+    transform: translateX(100%);
+  }
+}
+
+html,
+body {
+  max-width: 100% !important;
+  overflow-x: hidden !important;
+  width: 100% !important;
+}
+
+.recently-viewed-scroller {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.recently-viewed-scroller::-webkit-scrollbar {
+  display: none;
+  width: 0;
+  height: 0;
+}
+
+.home-below-fold > section,
+.home-below-fold > div {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 700px;
+}
+
+.product-card-deferred {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 450px;
+}

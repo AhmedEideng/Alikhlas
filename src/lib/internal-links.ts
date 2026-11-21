@@ -1,0 +1,702 @@
+/**
+ * ============================================================
+ * Internal Linking Engine — Smart Cross-Linking
+ * ============================================================
+ * Maps products → articles, articles → products, and provides
+ * related content suggestions for maximum internal link equity.
+ */
+
+import type { Product } from "@/data/product-types";
+import { articlesMeta } from "@/data/articles-meta.generated";
+import { getBundleProductType } from "@/lib/product-form";
+
+const LIVE_ARTICLE_SLUGS = new Set(articlesMeta.map((a) => a.slug));
+
+function filterLiveArticles(slugs: string[]): string[] {
+  return slugs.filter((s) => LIVE_ARTICLE_SLUGS.has(s));
+}
+
+// ─── Product → Article Mapping ───
+// Based on product name/slug keywords → relevant article slugs
+const ARTICLE_RULES: { test: RegExp; articles: string[] }[] = [
+  {
+    test: /(delay|تأخير|spray|بخاخ|procomil|dooz|reman|stallion|emla|lidocaine|60.minutes)/i,
+    articles: ["delay-sprays-safe-use", "premature-ejaculation", "side-effects-management"],
+  },
+  {
+    test: /(sildenafil|tadalafil|dapoxetine|viagra|cialis|levitra|vegal|fox|hard.on|cobra|porsche|love.extra)/i,
+    articles: ["erectile-dysfunction", "drug-interactions-sexual-products"],
+  },
+  {
+    test: /(honey|عسل|royal|ملكي|vitamax|hilti|golden.horse|black.horse|top.sellers|honeymoon)/i,
+    articles: ["royal-honey-benefits", "nutrition-libido"],
+  },
+  {
+    test: /(capsul|كبسول|hammer|boost|ginseng|powerfully|big.penis)/i,
+    articles: ["ginseng-complete-guide", "zinc-sexual-health"],
+  },
+  {
+    test: /(gel|جل|cream|كريم|titan|treand|merson|sotara|turbo|manuka|royal.cream|max.man|mr.big|leech)/i,
+    articles: ["safe-supplements", "side-effects-management"],
+  },
+  {
+    test: /(chocolate|شوكولا|dmas|ginseng.48|ferrari.choc|checoo)/i,
+    articles: ["nutrition-libido", "aphrodisiacs-real"],
+  },
+  {
+    test: /(coffee|قهوة|red.bull|energy|طاقة)/i,
+    articles: ["exercise-sexual-performance", "omega3-circulation-performance"],
+  },
+  {
+    test: /(pump|مضخة|ved|vacuum|digital|manual|konsa|sawft)/i,
+    articles: ["vacuum-pump-complete-guide", "prostate-health-sexual-function"],
+  },
+  {
+    test: /(extend|إطالة|traction|proextender)/i,
+    articles: ["exercise-sexual-performance", "myths-vs-facts-sexual-health"],
+  },
+  {
+    test: /(big.bro|breast|صدر|filler|تكبير)/i,
+    articles: ["max-filler-breast-guide", "vaginal-health-basics"],
+  },
+  {
+    test: /(gum|علكة|علك|sexlove|golden.gum|spanish.fly)/i,
+    articles: ["womens-libido-boosters", "buying-first-product-guide"],
+  },
+  {
+    test: /(drop|قطر|نقط|lady.era|connubial|black.widow|lipo|beauty.love|lovezone)/i,
+    articles: ["womens-libido-boosters", "estrogen-progesterone-women-guide"],
+  },
+  {
+    test: /(overtime|power.36|stallion|black.stallion|majestic)/i,
+    articles: ["testosterone-and-age", "myths-vs-facts-sexual-health"],
+  },
+  {
+    test: /(كبسول|capsul|مكمل|supplement|عشبي|herbal|طبيعي|natural)/i,
+    articles: ["safe-supplements", "myths-vs-facts-sexual-health"],
+  },
+  {
+    test: /(عسل|honey|شوكولا|chocolate|قهوة|coffee|طاقة|energy)/i,
+    articles: ["foods-to-avoid", "sleep-and-sex"],
+  },
+  {
+    test: /(حبوب|tablet|قرص|pill|كبسول|capsul)/i,
+    articles: ["when-to-see-doctor", "sexual-health-basics"],
+  },
+  {
+    test: /(نسائي|نساء|women|سيدات|أنثو|مهبل|vaginal)/i,
+    articles: ["contraception-options", "post-partum-recovery"],
+  },
+  {
+    test: /(رجال|men|ذكو|رجولة)/i,
+    articles: ["aging-and-intimacy", "communication-couples"],
+  },
+  {
+    test: /(جهاز|device|مضخ|pump|شد|extend)/i,
+    articles: ["body-image-confidence", "kegel-exercises"],
+  },
+  {
+    test: /(جل|gel|كريم|cream|موضعي|topical)/i,
+    articles: ["std-prevention", "masturbation-myths"],
+  },
+  {
+    test: /(قطر|drop|نقط|بخاخ|spray)/i,
+    articles: ["hormonal-changes", "women-orgasm"],
+  },
+  {
+    test: /(علكة|gum|شوكولا|chocolate|حلوى)/i,
+    articles: ["stress-and-libido", "first-night-anxiety-guide"],
+  },
+  {
+    test: /(تأخير|delay|تحكم|control|توقيت)/i,
+    articles: ["relationship-routine-revive", "exercise-sexual-performance"],
+  },
+  {
+    test: /best|أفضل|top|مميز|popular|مبيع|بست/i,
+    articles: ["best-selling-products-guide", "buying-first-product-guide", "safe-supplements"],
+  },
+  {
+    test: /(خصوبة|حمل|fertility|pregnant|إنجاب)/i,
+    articles: ["fertility-supplements-guide", "pre-marriage-health-guide"],
+  },
+  {
+    test: /(رمضان|صيام|ramadan|fasting)/i,
+    articles: ["sexual-health-during-ramadan", "natural-honey-dates-benefits"],
+  },
+  {
+    test: /(فحص|تحليل|checkup|test)/i,
+    articles: ["men-health-checkups", "chronic-diseases-intimacy"],
+  },
+  {
+    test: /(تنظيف|عناية|صيانة|hygiene|clean|maintenance)/i,
+    articles: ["device-maintenance-hygiene", "vacuum-pump-complete-guide"],
+  },
+  {
+    test: /(زواج|عرس|wedding|مقبل)/i,
+    articles: ["pre-marriage-health-guide", "first-night-anxiety-guide"],
+  },
+  {
+    test: /(خمسين|50|خامس)/i,
+    articles: ["intimacy-after-fifty", "aging-and-intimacy"],
+  },
+];
+
+const MEN_ARTICLES = ["testosterone-and-age", "exercise-sexual-performance"];
+
+/**
+ * Get relevant article slugs for a product (up to 2 live articles)
+ */
+export function getArticlesForProduct(product: Product): string[] {
+  if (LIVE_ARTICLE_SLUGS.size === 0) return [];
+  // Keep educational context stable when product copy changes; not an efficacy claim.
+  if (product.id === "m-60")
+    return filterLiveArticles(["premature-ejaculation", "delay-sprays-safe-use"]).slice(0, 2);
+  // Category precedes broad words such as energy, capsule, spray or ginseng.
+  if (product.category === "women") {
+    if (product.id === "w-20")
+      return filterLiveArticles(["max-filler-breast-guide", "body-image-confidence"]).slice(0, 2);
+    if (["w-14", "w-16"].includes(product.id))
+      return filterLiveArticles(["vaginal-health-basics", "women-products-complete-guide"]).slice(
+        0,
+        2,
+      );
+    return filterLiveArticles(["women-products-complete-guide", "womens-libido-boosters"]).slice(
+      0,
+      2,
+    );
+  }
+  if (product.category === "devices") {
+    if (product.id === "d-06")
+      return filterLiveArticles([
+        "device-maintenance-hygiene",
+        "myths-vs-facts-sexual-health",
+      ]).slice(0, 2);
+    return filterLiveArticles(["vacuum-pump-complete-guide", "device-maintenance-hygiene"]).slice(
+      0,
+      2,
+    );
+  }
+  const text = `${product.name} ${product.nameEn} ${product.slug}`;
+  const matched = new Set<string>();
+
+  for (const rule of ARTICLE_RULES) {
+    if (rule.test.test(text)) {
+      for (const slug of rule.articles) {
+        if (LIVE_ARTICLE_SLUGS.has(slug)) matched.add(slug);
+      }
+    }
+  }
+
+  // Add category-based fallbacks
+  const fallbacks = MEN_ARTICLES;
+
+  for (const slug of fallbacks) {
+    if (LIVE_ARTICLE_SLUGS.has(slug)) matched.add(slug);
+  }
+
+  return [...matched].slice(0, 2);
+}
+
+// ─── Article → Product Mapping ───
+// Explicit topical matches, not medical endorsements. Health-only articles have no sales fallback.
+const ARTICLE_PRODUCTS: Record<string, string[]> = {
+  "premature-ejaculation": ["m-31", "m-55", "m-30", "m-60"],
+  "delay-sprays-safe-use": ["m-55", "m-44"],
+  "why-delay-product-did-not-work-7-mistakes": ["m-55", "m-30", "m-60"],
+  "royal-honey-benefits": ["m-18", "m-11", "m-12", "m-20"],
+  "womens-libido-boosters": ["w-25", "w-10", "w-15"],
+  "women-products-complete-guide": ["w-25", "w-10", "w-15", "w-05", "w-17"],
+  "max-filler-breast-guide": ["w-20"],
+  "vacuum-pump-complete-guide": ["d-05", "d-07", "d-08", "d-01", "d-02"],
+  "device-maintenance-hygiene": ["d-05", "d-07", "d-08", "d-06"],
+  "ginseng-complete-guide": ["m-04", "m-02"],
+  "red-korean-ginseng-energy-endurance-benefits": ["m-04", "m-02"],
+  "peruvian-maca-root-benefits-for-vitality-and-energy": ["m-02"],
+  "peruvian-maca-root-energy-vitality-men-women": ["m-02"],
+  "hammer-of-thor-benefits-and-harms": ["m-01"],
+  "hard-on-sildenafil-dapoxetine-guide": ["m-34"],
+  // مقالات 2026-11-21: الربط بالمادة نفسها لا بالاسم التجاري.
+  "cialis-vs-viagra-vs-levitra": ["m-37", "m-45", "m-47"],
+  "erectile-dysfunction-causes": ["m-37", "m-45", "m-01", "m-04"],
+  "vaginal-dryness-causes": ["w-14", "w-16", "w-25"],
+};
+
+export function getProductsForArticle(articleSlug: string): string[] {
+  return [...(ARTICLE_PRODUCTS[articleSlug] ?? [])];
+}
+
+/**
+ * Get related article slugs for an article (3 articles)
+ */
+export function getRelatedArticles(
+  currentSlug: string,
+  currentCategory: string,
+  allArticles: { slug: string; category: string }[],
+): string[] {
+  // Priority: same category first, then related categories
+  const RELATED_CATS: Record<string, string[]> = {
+    "صحة الرجل": ["صحة الرجال", "تمارين", "هرمونات", "أساسيات", "وقاية"],
+    "صحة الرجال": ["صحة الرجل", "تمارين", "أساسيات", "وقاية"],
+    "صحة المرأة": ["هرمونات", "نفسية", "أساسيات", "علاقات", "وقاية"],
+    تغذية: ["تغذية ومكملات", "أساسيات", "هرمونات", "صحة الرجل"],
+    "تغذية ومكملات": ["تغذية", "صحة الرجل", "أساسيات", "هرمونات"],
+    أساسيات: ["صحة الرجل", "صحة المرأة", "وقاية", "تغذية", "نفسية"],
+    نفسية: ["علاقات", "صحة الرجل", "صحة المرأة", "أساسيات"],
+    علاقات: ["نفسية", "صحة المرأة", "أساسيات", "هرمونات"],
+    هرمونات: ["صحة الرجل", "صحة المرأة", "عمر", "تغذية ومكملات"],
+    تمارين: ["صحة الرجل", "صحة الرجال", "أساسيات", "صحة المرأة"],
+    عمر: ["هرمونات", "صحة الرجل", "صحة المرأة", "أساسيات"],
+    وقاية: ["أساسيات", "صحة المرأة", "صحة الرجل", "نفسية"],
+    أجهزة: ["صحة الرجل", "تمارين", "أساسيات", "وقاية"],
+  };
+
+  const relatedCats = RELATED_CATS[currentCategory] ?? [];
+  const result: string[] = [];
+
+  // Same category first
+  for (const a of allArticles) {
+    if (a.slug !== currentSlug && a.category === currentCategory && result.length < 1) {
+      result.push(a.slug);
+    }
+  }
+
+  // Related categories
+  for (const cat of relatedCats) {
+    for (const a of allArticles) {
+      if (a.slug !== currentSlug && a.category === cat && !result.includes(a.slug)) {
+        result.push(a.slug);
+        if (result.length >= 3) return result;
+      }
+    }
+  }
+
+  // Fill remaining
+  for (const a of allArticles) {
+    if (a.slug !== currentSlug && !result.includes(a.slug)) {
+      result.push(a.slug);
+      if (result.length >= 3) return result;
+    }
+  }
+
+  return result.slice(0, 3);
+}
+
+// ─── Landing Page → Article Mapping ───
+const LANDING_ARTICLE_RULES: { test: RegExp; articles: string[] }[] = [
+  {
+    test: /delay|تأخير|spray|cream.*delay|بخاخ/i,
+    articles: ["delay-sprays-safe-use", "premature-ejaculation", "side-effects-management"],
+  },
+  {
+    test: /erectile|انتصاب|sildenafil|tadalafil|viagra|cialis|levitra/i,
+    articles: [
+      "erectile-dysfunction",
+      "drug-interactions-sexual-products",
+      "prostate-health-sexual-function",
+    ],
+  },
+  {
+    test: /honey|عسل|royal/i,
+    articles: ["royal-honey-benefits", "nutrition-libido", "zinc-sexual-health"],
+  },
+  {
+    test: /women|نسا|female|libido.*women/i,
+    articles: ["womens-libido-boosters", "menopause-intimacy-guide", "vaginal-health-basics"],
+  },
+  {
+    test: /device|جهاز|pump|مضخ|ved/i,
+    articles: [
+      "vacuum-pump-complete-guide",
+      "prostate-health-sexual-function",
+      "exercise-sexual-performance",
+    ],
+  },
+  {
+    test: /supplement|مكمل|ginseng|maca|testosterone/i,
+    articles: ["ginseng-complete-guide", "zinc-sexual-health", "omega3-circulation-performance"],
+  },
+  {
+    test: /safety|سلامة|side.effect|تداخل|medication/i,
+    articles: [
+      "drug-interactions-sexual-products",
+      "side-effects-management",
+      "myths-vs-facts-sexual-health",
+    ],
+  },
+  {
+    test: /cairo|القاهرة|alexandria|الإسكندرية|delta|صعيد|shipping|شحن|cod|دفع/i,
+    articles: ["buying-first-product-guide", "safe-supplements", "myths-vs-facts-sexual-health"],
+  },
+  {
+    test: /anxiety|قلق|stress|توتر|confidence|ثقة/i,
+    articles: ["first-night-anxiety-guide", "stress-and-libido", "relationship-routine-revive"],
+  },
+  {
+    test: /nutrition|تغذية|food/i,
+    articles: ["nutrition-libido", "zinc-sexual-health", "omega3-circulation-performance"],
+  },
+  {
+    test: /exercise|تمارين|kegel|pelvic/i,
+    articles: ["exercise-sexual-performance", "kegel-exercises", "testosterone-and-age"],
+  },
+  {
+    test: /aging|عمر|40|menopause|يأس/i,
+    articles: [
+      "aging-and-intimacy",
+      "menopause-intimacy-guide",
+      "estrogen-progesterone-women-guide",
+    ],
+  },
+  {
+    test: /postpartum|ولادة|breast|ثدي|filler/i,
+    articles: ["post-partum-recovery", "vaginal-health-basics", "menopause-intimacy-guide"],
+  },
+  {
+    test: /natural|طبيعي|herbal|عشب/i,
+    articles: ["ginseng-complete-guide", "aphrodisiacs-real", "exercise-sexual-performance"],
+  },
+  {
+    test: /first.time|أول.مرة|مبتدئ|شراء/i,
+    articles: ["buying-first-product-guide", "myths-vs-facts-sexual-health", "safe-supplements"],
+  },
+  {
+    test: /couple|زوج|علاق|روتين|communication/i,
+    articles: ["relationship-routine-revive", "communication-couples", "first-night-anxiety-guide"],
+  },
+  {
+    test: /health|صح|basics|أساس|safe|أمان/i,
+    articles: ["sexual-health-basics", "when-to-see-doctor", "buying-first-product-guide"],
+  },
+  {
+    test: /women.*orgasm|إثارة|رعشة/i,
+    articles: ["women-orgasm", "hormonal-changes", "estrogen-progesterone-women-guide"],
+  },
+  {
+    test: /sleep|نوم|rest|راحة/i,
+    articles: ["sleep-and-sex", "stress-and-libido", "exercise-sexual-performance"],
+  },
+  {
+    test: /std|عدوى|وقاية|prevention/i,
+    articles: ["std-prevention", "contraception-options", "when-to-see-doctor"],
+  },
+  {
+    test: /body|جسم|image|صورة|ثقة/i,
+    articles: ["body-image-confidence", "masturbation-myths", "first-night-anxiety-guide"],
+  },
+  {
+    test: /food|طعام|avoid|تجنب/i,
+    articles: ["foods-to-avoid", "nutrition-libido", "zinc-sexual-health"],
+  },
+  {
+    test: /filler|max.*filler|تكبير.*ثدي/i,
+    articles: ["max-filler-breast-guide", "body-image-confidence", "vaginal-health-basics"],
+  },
+  {
+    test: /top|best|مميز|trending|أكثر|الأكثر/i,
+    articles: ["best-selling-products-guide", "buying-first-product-guide", "safe-supplements"],
+  },
+  {
+    test: /fertility|خصوبة|حمل/i,
+    articles: ["fertility-supplements-guide", "pre-marriage-health-guide", "zinc-sexual-health"],
+  },
+  {
+    test: /ramadan|رمضان|صيام/i,
+    articles: ["sexual-health-during-ramadan", "natural-honey-dates-benefits", "nutrition-libido"],
+  },
+  {
+    test: /marriage|زواج|عروس/i,
+    articles: ["pre-marriage-health-guide", "first-night-anxiety-guide", "communication-couples"],
+  },
+  {
+    test: /50|خمسين|elderly|كبار/i,
+    articles: ["intimacy-after-fifty", "aging-and-intimacy", "men-health-checkups"],
+  },
+  {
+    test: /clean|تنظيف|maintenance|صيانة/i,
+    articles: [
+      "device-maintenance-hygiene",
+      "vacuum-pump-complete-guide",
+      "side-effects-management",
+    ],
+  },
+];
+
+/**
+ * Get relevant article slugs for a landing page (up to 3 live articles)
+ */
+export function getArticlesForLandingPage(slug: string, title: string): string[] {
+  if (LIVE_ARTICLE_SLUGS.size === 0) return [];
+  const text = `${slug} ${title}`;
+  for (const rule of LANDING_ARTICLE_RULES) {
+    if (rule.test.test(text)) {
+      return filterLiveArticles(rule.articles).slice(0, 3);
+    }
+  }
+  return filterLiveArticles(["sexual-health-basics", "safe-supplements", "when-to-see-doctor"]);
+}
+
+/* ────────────────────────────────────────────────────────────
+ * ────────────────────────────────────────────────────────────
+ * العيب الذي يعالجه — مقيس على 89 صفحة مبنية:
+ *   أي **أول أربعة منتجات أبجديًا في القسم**. النتيجة الفعلية:
+ *     • 52 صفحة منتج (كل قسم الرجال تقريبًا) تعرض نفس الـ4 منتجات بالحرف.
+ *     • 89 صفحة → 22 مجموعة فقط مختلفة.
+ *     • 55 منتجًا لا تُشير إليه أي صفحة منتج (بلا روابط داخلة = بلا قوة).
+ *     • صلة موضوعية صفر: صفحة شوكولاتة توصي بكبسولات جينسنج.
+ *
+ * القواعد هنا — كلها من بيانات المنتج نفسه، بلا عشوائية وبلا وقت، فتخرج
+ * نفس النتيجة في كل بناء (وإلا اختلف HTML الثابت عن نسخة React بعد الـhydration):
+ *   1. نفس القسم (شرط، لا وزن).
+ *   2. نفس الشكل (جل مع جل) — أقوى إشارة صلة.
+ *   3. تقارب السعر (log-ratio) — «البدائل في نفس الفئة السعرية».
+ *   4. كلمات مشتركة في الاسم/الاسم الإنجليزي (عائلة البراند: عسل/عسل، …).
+ *   5. ألقاب بحث نوعية مشتركة (≥ 6 أحرف — «حبوب»/«جيل» العامة لا تُحسب).
+ *   6. موازنة التوزيع: كل اختيار سابق لنفس المنتج يخصم من رصيده، حتى لا
+ *      تتركز الروابط على أربعة منتجات.
+ *   7. تعويض: أي منتج لم يدخل أي قائمة يُحقن في أقرب صفحة له (بلا كسر الحد).
+ */
+
+/** أنواع الألقاب العامة التي لا تعني صلة — تُستثنى من إشارة «ألقاب مشتركة». */
+const GENERIC_ALIASES = new Set([
+  "حبوب",
+  "جيل",
+  "سبراي",
+  "كريم",
+  "نقط",
+  "عسل",
+  "شوكولاتة",
+  "تأخير",
+  "الصلابة",
+  "العسل الملكي",
+  "أقراص",
+  "كبسولات",
+]);
+
+const tokensOf = (value: string): Set<string> =>
+  new Set(
+    String(value)
+      .toLowerCase()
+      .split(/[^\p{L}\p{N}]+/u)
+      .filter((token) => token.length > 2),
+  );
+
+const specificAliasesOf = (product: Product): Set<string> =>
+  new Set(
+    (product.searchAliases ?? [])
+      .map((alias) => alias.trim())
+      .filter((alias) => alias.length >= 6 && !GENERIC_ALIASES.has(alias)),
+  );
+
+/** درجة الصلة بين منتجين من 0 إلى ~10. */
+function relatedScore(a: Product, b: Product): number {
+  let score = 0;
+
+  // الشكل: نفس النوع = أقوى إشارة («بديل من نفس الشكل»).
+  if (getBundleProductType(a) === getBundleProductType(b)) score += 4;
+
+  // السعر: تطابق تام = 3، وأي اختلاف ثلاثة أضعاف = 0 (مقياس لوغاريتمي).
+  if (a.price > 0 && b.price > 0) {
+    const ratio = Math.min(a.price, b.price) / Math.max(a.price, b.price);
+    score += 3 * Math.max(0, Math.min(1, (Math.log(ratio) + Math.log(3)) / Math.log(3)));
+  }
+
+  // عائلة الكلمات: «عسل … للرجال» مع «عسل … للنساء».
+  const aTokens = tokensOf(`${a.name} ${a.nameEn}`);
+  const bTokens = tokensOf(`${b.name} ${b.nameEn}`);
+  let shared = 0;
+  for (const token of aTokens) {
+    if (bTokens.has(token) && !GENERIC_NAME_TOKENS.has(token)) shared++;
+  }
+  score += Math.min(2, shared * 0.75);
+
+  // ألقاب بحث نوعية مشتركة (اسم براند شعبي مثل «بيرو ماكا»).
+  const aAliases = specificAliasesOf(a);
+  const bAliases = specificAliasesOf(b);
+  let aliasHits = 0;
+  for (const alias of aAliases) if (bAliases.has(alias)) aliasHits++;
+  score += Math.min(2, aliasHits);
+
+  return score;
+}
+
+/** كلمات لا تدل على صلة حتى لو تكررت («للرجال»، «منتجات» …). */
+const GENERIC_NAME_TOKENS = new Set([
+  "للرجال",
+  "للنساء",
+  "منتج",
+  "منتجات",
+  "الرجال",
+  "النساء",
+  "gel",
+  "cream",
+  "capsules",
+  "tablets",
+  "for",
+  "men",
+  "women",
+  "the",
+  "and",
+]);
+
+type RelatedCandidate = Product;
+
+/**
+ * يعيد قائمة «منتجات قد تعجبك» لمنتج واحد — محددة، متوازنة، وذات صلة.
+ *
+ * @param product المنتج الحالي
+ * @param sameCategory منتجات نفس القسم (بما فيها المنتج نفسه)
+ * @param options.limit الحد الأقصى (افتراضي 4) · options.exclude معرفات لا تُعرض
+ *                (البيع المتقاطع الصريح يُعرض في بلوك منفصل)
+ */
+export function getRelatedProducts<T extends RelatedCandidate>(
+  product: T,
+  sameCategory: T[],
+  options: { limit?: number; exclude?: string[] } = {},
+): T[] {
+  const limit = options.limit ?? 4;
+  const exclude = new Set([product.id, ...(options.exclude ?? [])]);
+  const candidates = sameCategory.filter((candidate) => !exclude.has(candidate.id));
+  if (candidates.length === 0) return [];
+
+  const usages = buildRelatedUsage(sameCategory);
+  const scored = candidates
+    .map((candidate) => {
+      const relevance = relatedScore(product, candidate);
+      const load = usages.get(candidate.id) ?? 0;
+      return { candidate, relevance, load, effective: relevance - load * 0.9 };
+    })
+    .sort(
+      (a, b) =>
+        b.effective - a.effective ||
+        b.relevance - a.relevance ||
+        a.candidate.id.localeCompare(b.candidate.id),
+    );
+
+  return scored.slice(0, limit).map((entry) => entry.candidate);
+}
+
+/**
+ * حساب عدد المرات التي اختير فيها كل منتج في قوائم القسم — يُستخدم كخصم
+ * حتى يتوزّع الربط بدل أن يتركز. تُحسب لكل القسم مرة واحدة (خريطة تُمرَّر
+ * خارجيًا لو احتاج المستدعي توزيعًا موحّدًا لكل الصفحات).
+ */
+export function buildRelatedUsage(sameCategory: RelatedCandidate[]): Map<string, number> {
+  const usage = new Map<string, number>();
+  const ordered = [...sameCategory].sort((a, b) => a.id.localeCompare(b.id));
+  for (const product of ordered) {
+    const exclude = new Set([product.id]);
+    const picks = ordered
+      .filter((candidate) => !exclude.has(candidate.id))
+      .map((candidate) => ({
+        candidate,
+        score: relatedScore(product, candidate) - (usage.get(candidate.id) ?? 0) * 0.9,
+      }))
+      .sort((a, b) => b.score - a.score || a.candidate.id.localeCompare(b.candidate.id))
+      .slice(0, 4);
+    for (const pick of picks) usage.set(pick.candidate.id, (usage.get(pick.candidate.id) ?? 0) + 1);
+  }
+  return usage;
+}
+
+/**
+ * يختار «منتجات قد تعجبك» لكل منتجات قسم واحد مرة واحدة، مع ضمان أن كل
+ * منتج يدخل في قائمة منتج آخر على الأقل (لا صفحة بلا روابط داخلة).
+ * هذا هو المدخل الذي يستخدمه الـprerender وواجهة React معًا.
+ */
+export function buildRelatedMap<T extends RelatedCandidate>(
+  sameCategory: T[],
+  options: { limit?: number; excludeById?: Map<string, string[]> } = {},
+): Map<string, T[]> {
+  const limit = options.limit ?? 4;
+  const ordered = [...sameCategory].sort((a, b) => a.id.localeCompare(b.id));
+  const chosen = new Map<string, T[]>();
+  const inbound = new Map<string, number>();
+
+  for (const product of ordered) {
+    const exclude = options.excludeById?.get(product.id) ?? [];
+    const picked: T[] = [];
+    const pool = ordered
+      .filter((candidate) => candidate.id !== product.id && !exclude.includes(candidate.id))
+      .map((candidate) => ({
+        candidate,
+        score: relatedScore(product, candidate) - (inbound.get(candidate.id) ?? 0) * 0.9,
+      }))
+      .sort((a, b) => b.score - a.score || a.candidate.id.localeCompare(b.candidate.id));
+
+    for (const entry of pool) {
+      if (picked.length >= limit) break;
+      picked.push(entry.candidate);
+      inbound.set(entry.candidate.id, (inbound.get(entry.candidate.id) ?? 0) + 1);
+    }
+    chosen.set(product.id, picked);
+  }
+
+  // تعويض المنتجات التي لم تدخل أي قائمة: تُحقن في أقرب قائمة لها باستبدال
+  // العنصر الأقل صلة فيها (حد ثابت 4 — لا نزيد عدد الروابط في الصفحة).
+  // (بيع متقاطع صريح) ننتقل للمضيف التالي — وإلا خرج منتج بلا روابط داخلة.
+  for (const product of ordered) {
+    if ((inbound.get(product.id) ?? 0) > 0) continue;
+    const host = ordered
+      .filter(
+        (other) =>
+          other.id !== product.id &&
+          !(options.excludeById?.get(other.id) ?? []).includes(product.id),
+      )
+      .map((other) => ({ other, score: relatedScore(other, product) }))
+      .sort((a, b) => b.score - a.score || a.other.id.localeCompare(b.other.id))[0];
+    if (!host) continue;
+    const list = chosen.get(host.other.id) ?? [];
+    if (list.length < limit) {
+      list.push(product);
+    } else {
+      // استبدال الأقل صلة بالمنتج صاحب الصلة (مع الحفاظ على الترتيب المنطقي).
+      let weakestIndex = 0;
+      let weakestScore = Infinity;
+      list.forEach((entry, index) => {
+        const score = relatedScore(host.other, entry);
+        if (score < weakestScore) {
+          weakestScore = score;
+          weakestIndex = index;
+        }
+      });
+      list[weakestIndex] = product;
+    }
+    chosen.set(host.other.id, list);
+    inbound.set(product.id, (inbound.get(product.id) ?? 0) + 1);
+  }
+
+  return chosen;
+}
+
+/**
+ * مدخل واحد يستهلكه الـprerender وواجهة React — مع كاش لكل قسم حتى لا تُحسب
+ * الخريطة (O(n²) صغيرة) مع كل صفحة. الكتالوج ثابت داخل البناء الواحد، والكاش
+ * يُصفَّر تلقائيًا مع أي HMR لأن الوحدة تُعاد تحميلها.
+ */
+const RELATED_CACHE = new Map<string, Map<string, Product[]>>();
+
+export function relatedProductsFor(
+  product: Product,
+  sameCategory: Product[],
+  options: { limit?: number; crossSellsOf?: (entry: Product) => Product[] } = {},
+): Product[] {
+  const limit = options.limit ?? 4;
+  // البيع المتقاطع المحسوب (`getCrossSellsForProduct`) أوسع من حقل crossSell
+  // اليدوي — يُمرَّر كدالة من المستدعي حتى لا تستورد هذه الوحدة الكتالوج.
+  const key = `${product.category}:${sameCategory.length}:${limit}:${options.crossSellsOf ? "resolved" : "raw"}`;
+  let map = RELATED_CACHE.get(key);
+  if (!map) {
+    const excludeById = new Map(
+      sameCategory.map((entry) => [
+        entry.id,
+        options.crossSellsOf
+          ? options.crossSellsOf(entry).map((item) => item.id)
+          : (entry.crossSell ?? []),
+      ]),
+    );
+    map = buildRelatedMap(sameCategory, { limit, excludeById });
+    RELATED_CACHE.set(key, map);
+  }
+  // لا تصفية بعد البناء: الاستبعاد محسوب داخل `buildRelatedMap` نفسه، وأي
+  return map.get(product.id) ?? [];
+}

@@ -1,0 +1,405 @@
+/**
+ * ============================================================
+ * 📊 GA4 E-commerce Events — نقطة الدخول الوحيدة لكل التتبع
+ * ============================================================
+ * نفس نمط page_view/scroll الموجود: لو gtag متاح نناديه، وإلا
+ * (GA لسه ما التحقش — التايمر لحد 5 ثواني) بنpush على dataLayer
+ * وهو بيتبعت عند تحميل GA. مفيش event بيضيع.
+ *
+ * ⚠️ الخصوصية: ما نرسلش أي PII (اسم/هاتف/عنوان) أبداً — البيانات
+ * المرسلة منتجات + مبالغ بس (نفس سياسة API الطلبات).
+ *
+ * الأحداث:
+ *   page_view        — visit (manual SPA + Enhanced Measurement)
+ *   view_item        — زيارة صفحة منتج
+ *   view_item_list   — عرض قائمة منتجات (فئة / بحث / دليل)
+ *   select_item      — اختيار منتج من قائمة
+ *   view_cart        — عرض السلة
+ *   add_to_cart      — إضافة للسلة
+ *   remove_from_cart — حذف من السلة
+ *   add_to_wishlist  — إضافة للمفضلة
+ *   remove_from_wishlist — حذف من المفضلة
+ *   view_promotion   — عرض بانر/عرض ترويجي
+ *   select_promotion — الضغط على بانر/عرض
+ *   begin_checkout   — تقديم الطلب (قبل التسجيل)
+ *   purchase         — الطلب اتسجل فعلياً في الشيت؛ ليس تأكيد تحصيل نقدي
+ *   scroll_milestone — قراءة 50%/90% (event مخصص لتجنب التصادم مع
+ *                      GA4's built-in `scroll` من Enhanced Measurement)
+ *   share_click      — مشاركة واتساب (click event بخصائص)
+ *   cta_click        — أي CTA رئيسي (زر الطلب، الـ quick-order)
+ *   search           — بحث الموقع (مخصص)
+ *   outbound_click   — outbound link click
+ *   file_download    — download click
+ *
+ *   - page_title artifact (متزامن مع الـ fix بتاع useErrorTracking)
+ *   - scroll event clash مع Enhanced Measurement
+ *   - ما فيش debug_mode / page_referrer يُرسل بدون query/hash أو PII
+ *   - view_item_list + select_item لكل قوائم المنتجات
+ *   - view_cart + wishlist events
+ *   - view/select_promotion
+ * ============================================================
+ */
+
+export const GA_CURRENCY = "EGP";
+
+/**
+ * page_view title artifact: لو الـ title مش مُمرر من route data، بتقرأ
+ * من document.title (اللي المتصفح ممكن يكون مترجمه) — بس لو الـ
+ * title مُمرر (الـ route اعرفه) → نبعثه هو. نفس الـ fix بتاع الـ
+ * page_view event، مطبّق هنا على الـ scroll event كمان.
+ */
+
+interface AnalyticsWindow {
+  gtag?: (...args: unknown[]) => void;
+  dataLayer?: unknown[];
+  google_tag_manager?: Record<string, unknown>;
+  /** يضعه public/gtm-init.js عندما تكون الحاوية مفعّلة فعلًا. */
+  __IKHLAS_GTM__?: string;
+}
+
+function emit(event: string, params: Record<string, unknown>) {
+  if (typeof window === "undefined") return;
+  const w = window as unknown as AnalyticsWindow;
+  w.dataLayer = w.dataLayer || [];
+
+  // 🥇 (2026-11-23) القاعدة الوحيدة المضمونة: كل الأحداث تُدفع بصيغة أوامر
+  // gtag، وهي الصيغة الوحيدة التي يفهمها gtag.js فتُرسل فعلًا إلى GA4 مع
+  // معاملات التجارة الإلكترونية.
+  //
+  // ما الذي كان يضيع قبل كده: كان الكود يدفع كائنات عادية
+  // ({ event, ...params }) عندما لا يكون gtag معرّفًا بعد. gtag.js يتجاهل
+  // الكائنات العادية تمامًا، فكانت الأحداث تمر في dataLayer وتُهمَل بصمت
+  // (page_view وحدها كانت تصل لأنها تُرسل بعد تحميل gtag).
+  //
+  // الحل: نضمن وجود دالة gtag (نفس shim القياسي في سنيبت جوجل) قبل أي حدث.
+  if (typeof w.gtag !== "function") {
+    w.gtag = (...args: unknown[]) => {
+      (w.dataLayer as unknown[]).push(args);
+    };
+  }
+  // GA4's gtag API requires the command "event" before the event name:
+  // gtag("event", "add_to_cart", params). Calling gtag(event, params)
+  // queues an unknown command and does not register the event in GA4.
+  w.gtag("event", event, params);
+}
+
+/** Keep analytics URLs free of query/hash data supplied by visitors. */
+function pathnameOnly(url: string): string {
+  if (!url) return "";
+  try {
+    const parsed = new URL(url, window.location.origin);
+    return `${parsed.origin}${parsed.pathname}`;
+  } catch {
+    return String(url).split(/[?#]/, 1)[0];
+  }
+}
+
+/** Remove query/hash data from outbound URLs before sending them to analytics. */
+function safeOutboundUrl(value: string): string {
+  try {
+    const raw = String(value).trim();
+    // GlobalTrackers supplies absolute anchor.href values. Reject relative or
+    // malformed caller input rather than treating it as a customer path.
+    if (!/^https?:\/\//i.test(raw)) return "";
+    const parsed = new URL(raw);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return "";
+    return `${parsed.origin}${parsed.pathname}`.slice(0, 300);
+  } catch {
+    // Invalid or non-URL values are not useful for analytics and may contain
+    // unstructured customer input; fail closed instead of forwarding them.
+    return "";
+  }
+}
+
+/**
+ * Search is useful for product insights, but it is still user input. Keep
+ * ordinary Arabic product terms while redacting obvious phone/email/URL data
+ * and bounding the payload before it reaches an analytics provider.
+ */
+function safeAnalyticsText(value: string): string {
+  const text = String(value).trim().slice(0, 100);
+  if (
+    /(?:https?:\/\/|www\.|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,})/i.test(text) ||
+    /(?:^|\D)\+?\d[\d\s().-]{6,}\d(?:$|\D)/.test(text)
+  ) {
+    return "[redacted]";
+  }
+  return text;
+}
+
+export interface TrackItem {
+  id: string;
+  name: string;
+  price: number;
+  qty: number;
+}
+
+/** صيغة الـ items القياسية في GA4 (item_id/item_name/price/quantity). */
+function gaItems(items: TrackItem[]) {
+  return items.map((i) => ({
+    item_id: i.id,
+    item_name: i.name,
+    price: i.price,
+    quantity: i.qty,
+    currency: GA_CURRENCY,
+  }));
+}
+
+export function trackViewItem(item: TrackItem) {
+  emit("view_item", { currency: GA_CURRENCY, items: gaItems([item]) });
+}
+
+export function trackAddToCart(item: TrackItem) {
+  emit("add_to_cart", {
+    currency: GA_CURRENCY,
+    value: Math.round(item.price * item.qty),
+    items: gaItems([item]),
+  });
+}
+
+export function trackRemoveFromCart(item: TrackItem) {
+  emit("remove_from_cart", {
+    currency: GA_CURRENCY,
+    value: Math.round(item.price * item.qty),
+    items: gaItems([item]),
+  });
+}
+
+/** Order totals include delivery; GA4 merchandise revenue must not.
+ * Allocate discounts proportionally to line totals. Rounding is to Egyptian
+ * piastres per line; unit prices retain precision for quantities > 1.
+ * This is analytics-only: checkout, WhatsApp and Sheets totals are unchanged.
+ */
+export function orderAnalyticsFinancials(items: TrackItem[], total: number, shipping: number) {
+  const subtotal = items.reduce((sum, item) => sum + item.price * item.qty, 0);
+  const value = Math.round(Math.max(0, Math.min(subtotal, total - shipping)) * 100) / 100;
+  let allocatedCents = 0;
+  const targetCents = Math.round(value * 100);
+  const mapped = gaItems(items).map((item, index) => {
+    const cents =
+      index === items.length - 1
+        ? targetCents - allocatedCents
+        : Math.floor(subtotal > 0 ? (targetCents * item.price * item.quantity) / subtotal : 0);
+    allocatedCents += cents;
+    const price = item.quantity > 0 ? cents / (100 * item.quantity) : 0;
+    return { ...item, price, discount: Math.max(0, item.price - price) };
+  });
+  return { value, items: mapped };
+}
+
+export function trackBeginCheckout(items: TrackItem[], value: number, shipping: number) {
+  emit("begin_checkout", {
+    currency: GA_CURRENCY,
+    ...orderAnalyticsFinancials(items, value, shipping),
+    shipping: Math.round(shipping),
+  });
+}
+
+/**
+ *
+ * @param url           path (window.location.pathname) — مع query لو موجود
+ * @param title         العنوان المقصود من الـ route (يتجنّب document.title artifact)
+ * @param options.referrer  من أين جاء الزائر (document.referrer)
+ * @param options.search    الـ search params لو موجودة (لتحليل الـ query)
+ * @param options.topic     موضوع الصفحة (من topics.ts لو متاح)
+ */
+export function trackPageView(
+  url: string,
+  title?: string,
+  options: { referrer?: string; search?: string; topic?: string } = {},
+) {
+  if (typeof window === "undefined") return;
+  const stableTitle = title && title.trim() ? title : document.title;
+  const payload: Record<string, unknown> = {
+    page_path: url,
+    page_location: pathnameOnly(window.location.href),
+    page_title: stableTitle,
+    page_referrer: options.referrer
+      ? pathnameOnly(options.referrer)
+      : pathnameOnly(document.referrer),
+  };
+  // الـ keywords اللي بتجيب زيارات لكل صفحة (organic search terms).
+  // Keep product terms, but never send an obvious phone/email/URL from input.
+  if (options.search) payload.page_search = safeAnalyticsText(options.search);
+  if (options.topic) payload.page_topic = options.topic;
+  emit("page_view", payload);
+}
+
+/**
+ */
+export function trackScrollMilestone(pct: number, pageTitle?: string) {
+  if (typeof window === "undefined") return;
+  const stableTitle = pageTitle && pageTitle.trim() ? pageTitle : document.title;
+  emit("scroll_milestone", {
+    percent_scrolled: pct,
+    page_title: stableTitle,
+    page_path: window.location.pathname,
+  });
+}
+
+/**
+ * بس ضروري لقياس الـ viral loop. ما نرسلش الـ نص الكامل
+ * (ممكن يكون طويل جداً ويملأ GA)، بس الـ metadata.
+ */
+export function trackShareClick(kind: "product" | "article" | "guide", refPath: string) {
+  emit("share_click", {
+    share_kind: kind,
+    share_from: refPath,
+  });
+}
+
+/**
+ * "اطلب عبر واتساب"، زرار "أضف للسلة"، الـ quick-order submit،
+ * البحث في الموقع. الـ `cta_name` للتجميع في GA.
+ */
+export function trackCtaClick(ctaName: string, location: string, extra?: Record<string, unknown>) {
+  emit("cta_click", { cta_name: ctaName, cta_location: location, ...extra });
+}
+
+/**
+ * خارجي (whatsapp.com/facebook/etc.). الـ url بنبعثه عشان نعرف
+ * الـ referrers في التقارير.
+ */
+export function trackOutboundClick(url: string, label: string) {
+  // WhatsApp order links carry customer name/phone/address in ?text=.
+  // Never forward that query string to GA or another analytics provider.
+  emit("outbound_click", { outbound_url: safeOutboundUrl(url), outbound_label: label });
+}
+
+/** قياس نقرات WhatsApp كمرحلة مستقلة، بدون تمرير نص الطلب أو بيانات العميل. */
+export function trackWhatsAppClick(url: string, context: string) {
+  emit("whatsapp_click", {
+    outbound_url: safeOutboundUrl(url),
+    whatsapp_context: context,
+  });
+}
+
+/** نجاح تسجيل الطلب فعلياً في Sheets، منفصل عن purchase المالي القياسي في GA4. */
+export function trackOrderSuccess(orderId: string, method: "whatsapp" | "direct") {
+  emit("order_success", { order_id: orderId, order_method: method });
+}
+
+/** فشل التسجيل الآلي؛ لا نعدّه إيراداً ولا نرسل أي بيانات عميل. */
+export function trackOrderFailed(orderId: string, method: "whatsapp" | "direct") {
+  emit("order_failed", { order_id: orderId, order_method: method });
+}
+
+/**
+ * purchase = قيمة المنتجات بعد الخصومات دون الشحن في GA4. مدخل value هو إجمالي الطلب،
+ * shipping/discount بيسنوا فراديتهم للتحليل.
+ */
+export function trackPurchase(
+  orderId: string,
+  items: TrackItem[],
+  value: number,
+  shipping: number,
+  discount: number,
+) {
+  emit("purchase", {
+    transaction_id: orderId,
+    currency: GA_CURRENCY,
+    ...orderAnalyticsFinancials(items, value, shipping),
+    shipping: Math.round(shipping),
+    discount: Math.round(discount),
+  });
+}
+
+/**
+ * بيتحرّك لما حد يدور في الـ SearchBar. الموقع بيدعم `?q=` URL
+ * (موجود في SearchAction) — بنبعث الـ search event عشان نعرف الـ
+ * keywords اللي الزوار بيدوروا عليها.
+ */
+export function trackSiteSearch(query: string, resultsCount: number) {
+  emit("search", { search_term: safeAnalyticsText(query), results_count: resultsCount });
+}
+
+/**
+ * `web_vitals`. بيتربط بـ LCP element لو معروف.
+ */
+export function trackWebVital(
+  name: "LCP" | "CLS" | "INP" | "FCP" | "TTFB",
+  value: number,
+  rating: string,
+  metricId?: string,
+) {
+  emit("web_vital", {
+    metric_name: name,
+    ...(metricId ? { metric_id: metricId } : {}),
+    metric_value: Math.round(value * 1000) / 1000,
+    metric_rating: rating,
+  });
+}
+
+export function analyticsListName(name: string): string {
+  if (name.startsWith("men_search_")) return "men_search_results";
+  if (name.startsWith("search_")) return name === "search_all" ? name : "search_results";
+  return safeAnalyticsText(name);
+}
+
+export function trackViewItemList(listName: string, items: TrackItem[]) {
+  if (items.length === 0) return;
+  emit("view_item_list", {
+    item_list_name: analyticsListName(listName),
+    items: gaItems(items),
+  });
+}
+
+export function trackSelectItem(listName: string, item: TrackItem) {
+  emit("select_item", {
+    item_list_name: analyticsListName(listName),
+    items: gaItems([item]),
+  });
+}
+
+export function trackViewCart(items: TrackItem[], value: number) {
+  if (items.length === 0) return;
+  emit("view_cart", {
+    currency: GA_CURRENCY,
+    value: Math.round(value),
+    items: gaItems(items),
+  });
+}
+
+export function trackAddToWishlist(item: TrackItem) {
+  emit("add_to_wishlist", {
+    currency: GA_CURRENCY,
+    value: Math.round(item.price),
+    items: gaItems([item]),
+  });
+}
+
+export function trackRemoveFromWishlist(item: TrackItem) {
+  emit("remove_from_wishlist", {
+    currency: GA_CURRENCY,
+    value: Math.round(item.price),
+    items: gaItems([item]),
+  });
+}
+
+export function trackViewPromotion(promoName: string, promoId?: string) {
+  emit("view_promotion", {
+    promotion_name: promoName,
+    promotion_id: promoId ?? promoName,
+  });
+}
+
+export function trackSelectPromotion(promoName: string, promoId?: string) {
+  emit("select_promotion", {
+    promotion_name: promoName,
+    promotion_id: promoId ?? promoName,
+  });
+}
+
+/** Funnel stages never include field values, phone numbers or addresses. */
+export function trackCheckoutStage(
+  stage: "open" | "start" | "submit",
+  context: "cart" | "quick_order",
+) {
+  emit(`checkout_${stage}`, { checkout_context: context });
+}
+export function trackOrderRequest(
+  durationMs: number,
+  outcome: "success" | "rejected" | "timeout" | "network_error",
+) {
+  emit("order_request", { duration_ms: Math.round(durationMs), request_outcome: outcome });
+}

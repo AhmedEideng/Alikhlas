@@ -1,0 +1,114 @@
+import { trackOrderRequest } from "@/lib/analytics";
+/**
+ * قائمة محافظات مصر + مصاريف الشحن.
+ * قيم الشحن هنا تُستورد منه، والـ build يولّد من نفس المصدر
+ * api/lib/config-db.json للسيرفر (artifact). لا يُعدَّل أي رقم يدويًا
+ * في الـ JSON — بيتسحب عند أول build.
+ */
+import {
+  GOVERNORATE_SHIPPING,
+  FREE_SHIPPING_THRESHOLD,
+  getShippingCost as sharedGetShippingCost,
+} from "@/lib/site-config";
+
+// إعادة تصدير للتوافق الخلفي — المصدر الفعلي هو site-config.
+export { GOVERNORATE_SHIPPING, FREE_SHIPPING_THRESHOLD } from "@/lib/site-config";
+
+export const EGYPT_GOVERNORATES = GOVERNORATE_SHIPPING.map((g) => g.name);
+
+export function qualifiesForFreeShipping(subtotal: number): boolean {
+  return subtotal >= FREE_SHIPPING_THRESHOLD;
+}
+
+/** 🚚 حساب مصاريف الشحن حسب المحافظة مع دعم الشحن المجاني */
+export function getShippingCost(governorate: string, subtotal = 0): number {
+  return sharedGetShippingCost(governorate, subtotal);
+}
+
+/** 🏷️ وصف منطقة الشحن */
+export function getShippingLabel(governorate: string): string {
+  const normalized = governorate.trim().replace(/\s+/g, " ");
+  return GOVERNORATE_SHIPPING.find((g) => g.name === normalized)?.region ?? "وجه بحري";
+}
+
+interface SheetSubmitResult {
+  success: boolean;
+  orderId?: string;
+  error?: string;
+}
+
+// Longer than the API's 10-second upstream deadline, so it can report its result.
+const ORDER_SUBMIT_TIMEOUT_MS = 15_000;
+
+/** إرسال الطلب للشيت مع إرجاع نتيجة واضحة للطلب المباشر */
+export async function submitToGoogleSheets(
+  data: Record<string, unknown>,
+  /** مهلة اختيارية (ms) — بعد انتهائها يُقطع الطلب ويُعامل كفشل (fallback عند المنادى). */
+  timeoutMs: number = ORDER_SUBMIT_TIMEOUT_MS,
+): Promise<SheetSubmitResult> {
+  const startedAt = Date.now();
+  let outcome: "success" | "rejected" | "timeout" | "network_error" = "network_error";
+  const controller = new AbortController();
+  const timer = timeoutMs ? setTimeout(() => controller.abort(), timeoutMs) : undefined;
+  try {
+    // إرسال الطلب إلى الـ API الوسيط — الأمان عبر CORS + Origin + Rate Limiting
+    const response = await fetch("/api/submit-order", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      outcome = "rejected";
+      const text = await response.text().catch(() => "");
+      throw new Error(`Google Sheets responded with ${response.status}: ${text.slice(0, 200)}`);
+    }
+
+    const result = (await response.json()) as SheetSubmitResult;
+    if (!result?.success) {
+      outcome = "rejected";
+      throw new Error(result?.error || "Google Sheets rejected the order");
+    }
+
+    outcome = "success";
+    return result;
+  } catch (err) {
+    if (controller.signal.aborted) outcome = "timeout";
+    console.error("Google Sheets:", err);
+    // Privacy by design: never persist customer name/phone/address in localStorage.
+    // WhatsApp remains the primary confirmation channel; direct checkout keeps the
+    // cart intact on failure so the customer can retry explicitly.
+    return {
+      success: false,
+      error: err instanceof Error ? err.message : "Unknown Google Sheets error",
+    };
+  } finally {
+    if (timer) clearTimeout(timer);
+    trackOrderRequest(Date.now() - startedAt, outcome);
+  }
+}
+
+/**
+ * إرسال الطلب "مع مغادرة الصفحة فوراً" (fire-and-forget مضمون الأمانة).
+ *
+ * لو العميل بيتحرك لواتساب مباشرةً (window.location) الـ fetch العادي ممكن
+ * يتقطع قبل ما يخلص فالطلب يفوت تسجيله في الشيت. navigator.sendBeacon
+ * مصمم خصيصاً للموقف ده: المتصفح نفسه بيكفل إرسال البيانات بعد التحميل
+ * (best-effort) بدون ما يبلّغنا برد.
+ *
+ * نفس نقطة النهاية /api/submit-order — مفيش منطق جديد، ومفيش رد بيتقرأ.
+ * @returns true لو المتصفح استقبل الإرسال، false لو مش متاح (fallback للـ fetch).
+ */
+export function beaconOrderToSheets(data: Record<string, unknown>): boolean {
+  try {
+    if (typeof navigator === "undefined" || typeof navigator.sendBeacon !== "function") {
+      return false;
+    }
+    const blob = new Blob([JSON.stringify(data)], { type: "application/json" });
+    return navigator.sendBeacon("/api/submit-order", blob);
+  } catch (err) {
+    console.error("Order beacon failed:", err);
+    return false;
+  }
+}

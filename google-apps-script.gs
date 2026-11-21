@@ -1,0 +1,1383 @@
+/**
+ * Al Ikhlas Medical — Google Sheets Webhook v2
+ *
+ * يستقبل الطلبات من الموقع ويسجلها في شيت "الطلبات"
+ * مع دعم حقول الخصم والعمود المتدرج.
+ *
+ * 🔐 Deployment checklist (2026-09-15 — شغّليها بالترتيب):
+ *   1. Project Settings → Script Properties → اضبط:
+ *        WEBHOOK_SECRET     = نفس قيمة GOOGLE_SHEETS_WEBHOOK_SECRET في Vercel (إلزامي)
+ *        REVIEW_READ_TOKEN  = نفس قيمة GOOGLE_SHEETS_REVIEWS_TOKEN في الخادم (لو مفيش مراجعات)
+ *        NOTIFICATION_EMAIL = إيميل الإشعارات (اختياري)
+ *        SPREADSHEET_ID     = معرف الشيت (سكريبت standalone بس)
+ *        ⚠ القيمة = المعرف فقط (النص بين /d/ و /edit في رابط الشيت)،
+ *          وليس الرابط كاملاً — openById() يرفض الروابط ويفشل الفتح.
+ *          لو السكريبت منشأ من داخل الشيت (Extensions → Apps Script)
+ *          فلا تضبطي هذه الخاصية إطلاقاً (يُستخدم الشيت الحاوي تلقائياً).
+ *   2. Vercel: تأكدي أن GOOGLE_SHEETS_WEBHOOK_SECRET مضبوط بنفس القيمة + Redeploy.
+ *   3. Deploy → Manage deployments → New version.
+ *   4. شغّلي migrateOrderSheetColumns() مرة واحدة من المحرر (Run) —
+ *      يضيف وقت الطلب بجوار التاريخ ويستعيد أوقاته المتاحة، ثم يحذف الأعمدة:
+ *      عدد المنتجات، تم تطبيق خصم، كود الإحالة، IP العميل.
+ *   5. شغّلي hideOrderDiscountColumns() مرة واحدة من المحرر (Run) لإخفاء
+ *      "قيمة الخصم" و"خصم الباقة" دون حذف البيانات؛ ويمكن إظهارهما لاحقاً.
+ *   6. شغّلي setupAutoCleanupTrigger() مرة واحدة من المحرر (Run) —
+ *      trigger التنظيف اليومي (PII بعد 90 يوم + المراجعات المرفوضة).
+ *   7. اختبري: POST تجريبي + GET للمراجعات.
+ *
+ * 🔒 السرور **مفيش في كود الملف** (2026-09-15): اتنقلت لـ Script
+ * Properties (runtime) عشان ما تدخلش بالغلط في commit — الـ auto-publish
+ * workflow بيعمل commit/push آلي، فأي سر في الكود كان خطر تشغيلي.
+ * WEBHOOK_SECRET فاضی = كل الكتابة مرفوضة (Fail Closed) — مش اختياري.
+ *
+ * التحسينات عن النسخة السابقة:
+ *   1. ✅ عمود "حالة الطلب" — لتتبع (جديد / تم التأكيد / تم الشحن / مكتمل / ملغي)
+ *   2. ✅ عمود "طريقة الطلب" — لتمييز واتساب عن الطلب المباشر
+ *   3. ✅ تحديد معدل الطلبات حسب IP في API دون حفظ IP ضمن سجل الطلب
+ *   4. ✅ إشعار إيميل تلقائي عند كل طلب جديد
+ *   5. ✅ حماية من الطلبات المكررة (نفس الـ orderId)
+ *   6. ✅ تنسيق تلقائي للشيت (ألوان + عرض أعمدة)
+ *   7. ✅ عمود "الحالة" محمي بـ Data Validation (قائمة خيارات ثابتة)
+ */
+
+const SHEET_NAME = "الطلبات";
+
+/**
+ * 📝 شيت المراجعات الحقيقية — كل مراجعة جديدة تسجل بحالة "قيد المراجعة"
+ * والمالك يعتمد أو يرفضها من عمود "الحالة" (نفس نموذج متابعة الطلبات).
+ * المراجعات المعتمدة فقط هي التي تظهر على الموقع عبر /api/reviews.
+ */
+const REVIEWS_SHEET_NAME = "المراجعات";
+
+const REVIEWS_COLUMNS = [
+  { header: "التاريخ", key: "date", width: 140 },
+  { header: "معرف المنتج", key: "productId", width: 90 },
+  { header: "اسم المنتج", key: "productName", width: 300 },
+  { header: "التقييم", key: "rating", width: 80 },
+  { header: "اسم المراجع", key: "reviewerName", width: 150 },
+  { header: "الهاتف (للتحقق)", key: "reviewerPhone", width: 120 },
+  { header: "المراجعة", key: "reviewText", width: 400 },
+  { header: "الحالة", key: "status", width: 110 },
+  { header: "شراء موثق", key: "verified", width: 100 },
+];
+
+const REVIEW_STATUS_PENDING = "قيد المراجعة";
+const REVIEW_STATUS_APPROVED = "معتمد";
+const REVIEW_STATUS_REJECTED = "مرفوض";
+
+const REVIEW_MAX_TEXT = 600;
+const REVIEW_MIN_TEXT = 10;
+const REVIEW_MAX_NAME = 60;
+const REVIEW_MAX_PRODUCT = 200;
+const REVIEW_LIST_LIMIT = 20;
+const REVIEW_CACHE_TTL_SEC = 300; // حماية حصة Apps Script (تخزين مؤقت لكل منتج)
+
+/**
+ * 🔐 قراءة السرور والإعدادات من Script Properties (2026-09-15):
+ * Project Settings → Script Properties. مفيش سر في الكود نفسه.
+ * الأمان محفوظ: قيمة فاضية = الميزة معطلة / الكتابة مرفوضة (fail-closed).
+ */
+function scriptProp(name) {
+  try {
+    return PropertiesService.getScriptProperties().getProperty(name) || "";
+  } catch (e) {
+    return "";
+  }
+}
+
+// 🔒 سر كتابة الـ webhook — إلزامي: فاضی = doPost بيرفض كل الكتابة.
+// لازم يوافق GOOGLE_SHEETS_WEBHOOK_SECRET في Vercel.
+const WEBHOOK_SECRET = scriptProp("WEBHOOK_SECRET");
+
+// 🔒 توكن قراءة المراجعات — لازم يوافق GOOGLE_SHEETS_REVIEWS_TOKEN
+// في الخادم. فاضی = قراءة المراجعات معطلة تماماً (fail-closed).
+const REVIEW_READ_TOKEN = scriptProp("REVIEW_READ_TOKEN");
+
+// 🟢 معرف الشيت (Spreadsheet ID) — للسكريبت standalone بس
+// (لو اتعمل من script.google.com خارج الشيت).
+const SPREADSHEET_ID = scriptProp("SPREADSHEET_ID");
+
+// 📧 إيميل إشعارات الطلبات/المراجعات — اختياري (فاضی = من غير إشعارات).
+const NOTIFICATION_EMAIL = scriptProp("NOTIFICATION_EMAIL");
+
+function getSpreadsheet() {
+  if (typeof SPREADSHEET_ID !== "undefined" && SPREADSHEET_ID && SPREADSHEET_ID.trim() !== "") {
+    try {
+      return SpreadsheetApp.openById(SPREADSHEET_ID.trim());
+    } catch (err) {
+      console.error("Failed to open spreadsheet by ID:", err);
+      throw new Error("تعذر فتح الشيت باستخدام المعرف SPREADSHEET_ID المحدد.");
+    }
+  }
+
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (!ss) {
+    throw new Error(
+      "خطأ فني: السكريبت مستقل ولم يتم ربطه بمعرف شيت. يرجى وضع معرف الشيت في Project Settings → Script Properties تحت اسم SPREADSHEET_ID، أو إنشاء السكريبت من داخل الشيت نفسه عبر Extensions -> Apps Script.",
+    );
+  }
+  return ss;
+}
+
+const COLUMNS = [
+  { header: "التاريخ", key: "date", width: 140 },
+  { header: "وقت الطلب", key: "time", width: 105 },
+  { header: "رقم الطلب", key: "orderId", width: 130 },
+  { header: "حالة الطلب", key: "orderStatus", width: 100 },
+  { header: "اسم العميل", key: "customerName", width: 150 },
+  { header: "الهاتف", key: "customerPhone", width: 120 },
+  { header: "المحافظة", key: "governorate", width: 110 },
+  { header: "العنوان", key: "address", width: 200 },
+  { header: "المنتجات", key: "itemsText", width: 350 },
+  // معرفات المنتجات (ids) — للتحقق الآمن من "مشتري مؤكد" بمعرّف ثابت
+  // لا يتغير بتغيير الاسم التسويقي (البحث بالاسم يبقى fallback للطلبات القديمة)
+  { header: "معرفات المنتجات", key: "productIds", width: 120 },
+  { header: "المجموع قبل الخصم", key: "subtotalBeforeDiscount", width: 120 },
+  { header: "قيمة الخصم", key: "discount", width: 90 },
+  { header: "خصم الباقة", key: "bundleDiscount", width: 90 },
+  { header: "المجموع بعد الخصم", key: "subtotal", width: 120 },
+  { header: "الشحن", key: "shipping", width: 80 },
+  { header: "الإجمالي النهائي", key: "total", width: 110 },
+  { header: "ملاحظات", key: "notes", width: 200 },
+  { header: "طريقة الطلب", key: "orderMethod", width: 100 },
+  { header: "نوع الطلب", key: "orderType", width: 90 },
+];
+
+// الأعمدة تبقى مخزنة ومستخدمة في الحسابات، لكن يمكن إخفاؤها عن العرض اليومي.
+const HIDDEN_ORDER_HEADERS = new Set(["قيمة الخصم", "خصم الباقة"]);
+
+const MAX_ITEMS = 50;
+const MAX_TEXT = {
+  orderId: 40,
+  name: 100,
+  phone: 16,
+  governorate: 50,
+  address: 200,
+  notes: 300,
+  itemName: 150,
+  orderMethod: 30,
+};
+
+const RATE_LIMIT_WINDOW_SEC = 60;
+const RATE_LIMIT_MAX = 15;
+
+// عدد الصفوف التي يغطيها الـ Data Validation لعمود "الحالة" عند الإنشاء.
+// ensureStatusValidation() يمدّد النطاق تلقائياً لو اقتربت الصفوف من الحد.
+const VALIDATION_ROWS = 5000;
+
+// ============================================================
+// Main POST handler
+// ============================================================
+
+function doPost(e) {
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(10000);
+
+    // payload: بارامتر form "data" (العقد الحالي مع Vercel —
+    // submit-order.js و submit-review.js بيبعتوا
+    // application/x-www-form-urlencoded + data=JSON.stringify(...)).
+    // fallback: البدن الخام لو اتبعت JSON body مباشر (e.postData.contents)
+    // — يجعل الـ webhook مرن مع أي عميل مستقبل أو فحص يدوي بـ curl.
+    var rawData =
+      (e && e.parameter && e.parameter.data) || (e && e.postData && e.postData.contents) || "";
+    if (!rawData) {
+      throw new Error("Missing payload");
+    }
+
+    var data = JSON.parse(rawData);
+
+    // 🔒 حماية الكتابة — Fail Closed: لو السر غير مضبوط أو ناقص أو غلط
+    // → نرفض. ده يقفل ثغرة "الوصول المباشر لـ /exec" اللي كانت بتتجاوز
+    // كل تحقق طبقة Vercel (منتج/سعر/مخزون/خصم/شحن/إجمالي).
+    // التفعيل: اضبطي WEBHOOK_SECRET في Script Properties +
+    // GOOGLE_SHEETS_WEBHOOK_SECRET في Vercel بنفس القيمة
+    // (Vercel بيبعت السر جوه الـ payload تلقائيًا).
+    if (!WEBHOOK_SECRET || data.secret !== WEBHOOK_SECRET) {
+      return json({ success: false, error: "Forbidden" });
+    }
+
+    // 📝 مسار مختلف: إرسال مراجعة منتج (نفس ال- webhook، action مختلف)
+    if (data.action === "review") {
+      return handleReviewPost(data);
+    }
+
+    var items = normalizeItems(data.items);
+    if (!items.length) throw new Error("No order items");
+
+    var customerName = clean(data.customerName, MAX_TEXT.name);
+    // Validate the canonical phone before Sheet formula-escaping. Egyptian local
+    // numbers and E.164 international numbers are both accepted by the frontend/API.
+    var rawCustomerPhone = String(data.customerPhone || "").trim();
+    var isLocalEgypt = /^01[0125][0-9]{8}$/.test(rawCustomerPhone);
+    var isInternational = /^\+[1-9][0-9]{6,14}$/.test(rawCustomerPhone);
+    if (!isLocalEgypt && !isInternational) throw new Error("Invalid customer phone");
+    var customerPhone = clean(rawCustomerPhone, MAX_TEXT.phone);
+    var governorate = clean(data.governorate, MAX_TEXT.governorate);
+    var address = clean(data.address, MAX_TEXT.address);
+    var notes = clean(data.notes, MAX_TEXT.notes);
+    var orderMethod = clean(data.paymentMethod || "واتساب", MAX_TEXT.orderMethod);
+    var orderType = normalizeOrderType(data.orderType);
+
+    if (!customerName) throw new Error("Missing customer name");
+    if (!governorate) throw new Error("Missing governorate");
+    if (!address && orderMethod !== "واتساب") throw new Error("Missing address");
+
+    // Rate limiting
+    // (2026-09-30) كان فيه استثناء قديم يحوّل المفتاح لـ IP لرقم تجريبي محدد
+    // (01000000000) — لا يستخدمه أي تدفق حي ولا أي اختبار e2e حالي، فأُزيل
+    // تبسيطةً: المفتاح دوماً هاتف العميل (15 طلب/دقيقة لكل هاتف).
+    var rateLimitKey = customerPhone;
+    if (!checkRateLimit(rateLimitKey)) {
+      throw new Error("Too many requests; please wait a moment");
+    }
+
+    var sheet = getOrCreateSheet(SHEET_NAME);
+
+    // حماية من الطلبات المكررة
+    var orderId = clean(data.orderId, MAX_TEXT.orderId);
+    if (orderId && isDuplicateOrder(sheet, orderId)) {
+      return json({ success: true, orderId: orderId, note: "duplicate — already recorded" });
+    }
+
+    // Fallback order ID
+    if (!orderId) {
+      var nextRow = sheet.getLastRow() + 1;
+      var orderNum = nextRow - 1;
+      orderId = "#IK-" + ("0000" + orderNum).slice(-5);
+    }
+
+    var subtotalBeforeDiscount = numberOrZero(data.subtotalBeforeDiscount);
+    var discount = numberOrZero(data.discount);
+    var bundleDiscount = numberOrZero(data.bundleDiscount);
+    var subtotal = numberOrZero(data.subtotal);
+    var shipping = numberOrZero(data.shipping);
+    var total = numberOrZero(data.total);
+
+    // Explicit labeled lines: mixed Arabic/Latin names must not make qty/price
+    // appear swapped. This is display only; numeric columns stay unchanged.
+    var itemsText = formatOrderItemsText(items);
+
+    // يُنشأ الطابع الزمني داخل Apps Script وقت تسجيل الطلب؛ لا نأخذ الوقت من العميل.
+    var orderTimestamp = new Date();
+    var rowValues = {
+      date: orderTimestamp, // كائن Date حقيقي؛ وقت الطلب المنفصل يُشتق من اللحظة نفسها
+      time: formatOrderTime(orderTimestamp),
+      orderId: orderId,
+      orderStatus: "جديد",
+      customerName: customerName,
+      customerPhone: customerPhone,
+      governorate: governorate,
+      address: address || "سيتم تأكيده على واتساب",
+      itemsText: itemsText,
+      productIds: items
+        .map(function (it) {
+          return it.id;
+        })
+        .filter(Boolean)
+        .join(", "),
+      subtotalBeforeDiscount: subtotalBeforeDiscount,
+      discount: discount,
+      bundleDiscount: bundleDiscount,
+      subtotal: subtotal,
+      shipping: shipping,
+      total: total,
+      notes: notes,
+      orderMethod: orderMethod,
+      orderType: orderType,
+    };
+
+    appendRowByHeaders(
+      sheet,
+      COLUMNS,
+      neutralizeRowValues(rowValues, ["customerName", "address", "notes"]),
+    );
+
+    // إشعار إيميل
+    sendOrderNotification(orderId, customerName, customerPhone, governorate, total, itemsText);
+
+    return json({ success: true, orderId: orderId });
+  } catch (err) {
+    // 🔒 لا نعيد تفاصيل الخطأ الداخلية للمستخدم (قد تكشف بنية الشيت أو أسماء متغيرات).
+    // نعيد رسالة عامة آمنة، ونسجّل التفاصيل للتصحيح داخلياً فقط.
+    console.error("Webhook error:", err);
+    return json({ success: false, error: "تعذر تسجيل الطلب. يرجى المحاولة مرة أخرى." });
+  } finally {
+    try {
+      lock.releaseLock();
+    } catch (err) {
+      // safe to ignore
+    }
+  }
+}
+
+function doGet(e) {
+  // 📝 مسار قراءة المراجعات المعتمدة — محمي بتوكن (action=reviews&token=...)
+  // ولا يكشف أي بيانات إلا بعد التحقق.
+  if (e && e.parameter && e.parameter.action === "reviews") {
+    return handleReviewsGet(e.parameter);
+  }
+
+  // 🔒 لا نكشف أي إحصاءات (عدد الطلبات/حالة الشيت) للزيارات العامة عبر GET.
+  // هذا يمنع تسريب معلومات تشغيلية لأي شخص يمتلك رابط الـ webhook.
+  return json({ status: "Al Ikhlas Webhook Active" });
+}
+
+// ============================================================
+// 📝 Real Customer Reviews (moderated)
+// ============================================================
+// تدفق المراجعة:
+//   1) العميل يرسل مراجعة (تقييم + نص + اسم اختياري + هاتف اختياري للتحقق).
+//   2) تُسجل في شيت "المراجعات" بحالة "قيد المراجعة" — لا تظهر على الموقع.
+//   3) المالك يفتح الشيت ويغيّر الحالة إلى "معتمد" (أو "مرفوض").
+//   4) الموقع يسحب المعتمدة فقط عبر doGet?action=reviews (بالتوكن).
+// "شراء موثق": لو العميل زوّد هاتفه، نفحص شيت "الطلبات" عن طلب منه
+// يشمل هذا المنتج بالاسم الكامل — إن وُجد: "نعم" (شارة "مشتري مؤكد").
+
+function handleReviewPost(data) {
+  try {
+    var productId = clean(data.productId, 40);
+    var productName = clean(data.productName, REVIEW_MAX_PRODUCT);
+    var ratingNum = parseInt(data.rating, 10);
+    if (!productId || !productName) throw new Error("Missing product");
+    if (!isFinite(ratingNum) || ratingNum < 1 || ratingNum > 5) throw new Error("Invalid rating");
+
+    var reviewerName = clean(data.reviewerName, REVIEW_MAX_NAME);
+    var rawPhone = String(data.reviewerPhone || "").trim();
+    var isLocalEgypt = /^01[0125][0-9]{8}$/.test(rawPhone);
+    var isInternational = /^\+[1-9][0-9]{6,14}$/.test(rawPhone);
+    if (rawPhone && !isLocalEgypt && !isInternational) throw new Error("Invalid phone");
+    // (2026-09-15) تخزين بالصيغة الموحدة (010...) — نفس الرقم متهتش
+    // تطابق "شراء موثق" بسبب الصيغة اللي اتكتب بيها.
+    var reviewerPhone = rawPhone ? normalizePhoneForMatch(rawPhone) : "";
+
+    var reviewText = clean(data.reviewText, REVIEW_MAX_TEXT);
+    if (reviewText.length < REVIEW_MIN_TEXT) throw new Error("Review too short");
+
+    // Rate limiting — بالهاتف إن وُجد وإلا بالـ IP
+    var clientIp = clean(data.clientIp, 64);
+    var rateKey = reviewerPhone || clientIp || "";
+    if (!rateKey || !checkRateLimit("review:" + rateKey)) {
+      throw new Error("Too many requests; please wait a moment");
+    }
+
+    var verified = reviewerPhone
+      ? hasVerifiedPurchase(reviewerPhone, productId, productName)
+      : "لا";
+
+    var sheet = getOrCreateReviewsSheet();
+    appendRowByHeaders(sheet, REVIEWS_COLUMNS, {
+      date: new Date(), // (2026-09-15) كائن Date حقيقي مش نص منطّق — cleanup موثوق للأبد
+      productId: productId,
+      productName: productName,
+      rating: ratingNum,
+      reviewerName: reviewerName,
+      reviewerPhone: reviewerPhone,
+      reviewText: reviewText,
+      status: REVIEW_STATUS_PENDING,
+      verified: verified,
+    });
+
+    sendReviewNotification(
+      productId,
+      productName,
+      reviewerName || "عميل",
+      ratingNum,
+      reviewText,
+      verified,
+    );
+    return json({ success: true, status: REVIEW_STATUS_PENDING });
+  } catch (err) {
+    // 🔒 رسالة عامة آمنة — لا نكشف تفاصيل داخلية (نفس سياسة doPost)
+    console.error("Review webhook error:", err);
+    return json({ success: false, error: "تعذر تسجيل مراجعتك. يرجى المحاولة مرة أخرى." });
+  }
+}
+
+/** هل يوجد طلب موثق من هذا الهاتف يشمل المنتج؟ (بحث في شيت "الطلبات") */
+function hasVerifiedPurchase(phone, productId, productName) {
+  try {
+    var ss = getSpreadsheet();
+    var ordersSheet = ss.getSheetByName(SHEET_NAME);
+    if (!ordersSheet || ordersSheet.getLastRow() <= 1) return "لا";
+
+    var headers = readSheetHeaders(ordersSheet);
+    var phoneCol = -1;
+    var itemsCol = -1;
+    var statusCol = -1;
+    var idsCol = -1;
+    for (var i = 0; i < headers.length; i++) {
+      var h = headers[i];
+      if (h === "الهاتف") phoneCol = i + 1;
+      else if (h === "المنتجات") itemsCol = i + 1;
+      else if (h === "حالة الطلب") statusCol = i + 1;
+      else if (h === "معرفات المنتجات") idsCol = i + 1;
+    }
+    if (phoneCol <= 0) return "لا";
+    // التحقق من شراء مؤكد يحتاج عمود الحالة أيضاً. لا نعتبر صفاً قديماً
+    // "مكتملًا" لمجرد غياب العمود؛ ذلك كان يسمح بتعليم أي طلب تاريخي
+    // كمشتري موثق قبل ترحيل بنية الشيت.
+    if (statusCol <= 0) return "لا";
+    // لا يمكن التحقق بدون أي مصدر مطابقة (طلب من قبل إضافة العمودين معاً)
+    if (itemsCol <= 0 && idsCol <= 0) return "لا";
+
+    var lastRow = ordersSheet.getLastRow();
+    var phoneRange = ordersSheet.getRange(2, phoneCol, lastRow - 1, 1).getValues();
+    var itemsRange =
+      itemsCol > 0 ? ordersSheet.getRange(2, itemsCol, lastRow - 1, 1).getValues() : [];
+    var idsRange = idsCol > 0 ? ordersSheet.getRange(2, idsCol, lastRow - 1, 1).getValues() : [];
+    var statusRange =
+      statusCol > 0 ? ordersSheet.getRange(2, statusCol, lastRow - 1, 1).getValues() : [];
+
+    for (var r = 0; r < phoneRange.length; r++) {
+      // (2026-09-15) تطبيع الجانبين: 010... / +2010... / 002010... نفس الرقم
+      if (normalizePhoneForMatch(phoneRange[r][0]) !== normalizePhoneForMatch(phone)) continue;
+      // (2026-09-15) "شراء موثق" = طلب **مكتمل** فعلًا (وصل + دُفع COD).
+      // "جديد/تم التأكيد/تم الشحن" لسه مش شراء مؤكد (الدفع عند الاستلام
+      // بيحصل عند التسليم). لو الإدارة قررت إن "تم التأكيد" أو أجدى يكفى،
+      // عدّل الشرط هنا بس.
+      if (statusCol > 0 && String(statusRange[r][0] || "").trim() !== "مكتمل") continue;
+
+      var idsCell = idsRange.length ? String(idsRange[r][0] || "").trim() : "";
+      if (idsCell) {
+        // ✅ المسار المفضل: مطابقة معرف ثابت لا يتأثر بتغيير الاسم التسويقي
+        var idTokens = idsCell.split(",").map(function (t) {
+          return t.trim();
+        });
+        if (idTokens.indexOf(productId) !== -1) return "نعم";
+      } else if (itemsRange.length) {
+        // fallback للطلبات القديمة (قبل عمود المعرفات): مطابقة بالاسم الرسمي
+        if (String(itemsRange[r][0] || "").indexOf(productName) !== -1) return "نعم";
+      }
+    }
+    return "لا";
+  } catch (err) {
+    console.error("hasVerifiedPurchase failed:", err);
+    return "لا";
+  }
+}
+
+/** إشعار إيميل عند وصول مراجعة جديدة (يُفعَّل بإعداد NOTIFICATION_EMAIL) */
+function sendReviewNotification(productId, productName, name, rating, text, verified) {
+  if (!NOTIFICATION_EMAIL) return;
+  try {
+    var body = [
+      "مراجعة جديدة من " + name + " (" + rating + "/5)",
+      "المنتج: " + productName + " (" + productId + ")",
+      "شراء موثق: " + (verified === "نعم" ? "نعم ✓" : "لا"),
+      "",
+      text,
+      "",
+      'اعتمد أو ارفض المراجعة من عمود "الحالة" في شيت "' + REVIEWS_SHEET_NAME + '".',
+      "افتح الشيت: " + getSpreadsheet().getUrl(),
+    ].join("\n");
+    MailApp.sendEmail(NOTIFICATION_EMAIL, "⭐ مراجعة جديدة — " + productName, body);
+  } catch (err) {
+    // لا توقف تسجيل المراجعة بسبب فشل الإيميل
+    console.error("Review notification failed:", err);
+  }
+}
+
+/** قراءة المراجعات المعتمدة فقط — محمي بتوكن، بدون هاتف، بحد 20 وأسرعها أولاً */
+/**
+ * توقيع HMAC-SHA256 (hex) — السر نفسه لا يسافر عبر الشبكة أبداً.
+ *
+ * ⚠️ computeHmacSha256Signature ترجع Byte[] مباشرة (حسب وثائق Google الرسمية
+ * — ليس كائناً يحتاج .getBytes()، وليس نصاً base64). استدعاء .getBytes()
+ * على المصفوفة كان يفجّر TypeError داخل doGet → صفحة خطأ HTML من جوجل
+ * (سبب "Unexpected token '<'" في لوغات Vercel على /api/reviews).
+ *
+ * ⚠️ القيم داخل Byte[] قد تظهر SIGNED (-128..127) في بعض السياقات:
+ * بدون التطبيع أدناه، أي بايت ≥ 0x80 ينتج نصاً خاطئاً ("-88" بدل "78")،
+ * فيفشل المطابقة مع digest الـ Node.js دائماً. التطبيع b<0 ? b+256 : b
+ * يجعل النتيجة مطابقة لـ digest hex القياسي في Node/أي runtime.
+ *
+ * متجه تحقق عبر الـ runtimes (يُتحقق مرة واحدة من المحرر بعد النشر):
+ *   hmacHex("reviews|m-01|1760000000|abc123", "test-secret")
+ * يجب أن يعيد حرفياً:
+ *   fdcd4ebe7a579b4cfebe2c2726c33bc2e0e0a37d455132bc13fa595575c5a205
+ * (نفس القيمة المثبتة في src/__tests__/reviews-api.test.ts)
+ */
+function hmacHex(data, key) {
+  var bytes = Utilities.computeHmacSha256Signature(data, key);
+  var hex = "";
+  for (var i = 0; i < bytes.length; i++) {
+    var b = bytes[i] < 0 ? bytes[i] + 256 : bytes[i];
+    hex += ("0" + b.toString(16)).slice(-2);
+  }
+  return hex;
+}
+
+function handleReviewsGet(params) {
+  // 🔒 توقيع HMAC قصير العمر بدل توكن ثابت في الـ URL:
+  // الخادم يحسب sig = HMAC(secret, "reviews|product|ts|nonce") ويرسل
+  // (ts, nonce, sig) فقط — السر لا يظهر في أي URL أو سجل وسيط.
+  // الحماية من إعادة التشغيل على مستويين:
+  //   1) Freshness: التوقيع صالح 5 دقائق فقط (نافذة ts).
+  //   2) Single-use nonce: أي nonce استُخدم مرة يرفض (CacheService, 10 دقائق).
+  if (!REVIEW_READ_TOKEN) return json({ success: false, error: "Forbidden" });
+  var product = String(params.product || "").trim();
+  var ts = String(params.ts || "").trim();
+  var nonce = String(params.nonce || "").trim();
+  var sig = String(params.sig || "")
+    .trim()
+    .toLowerCase();
+  if (!product || !ts || !nonce || !sig) {
+    return json({ success: false, error: "Forbidden" });
+  }
+  var reqSec = parseInt(ts, 10);
+  var nowSec = Math.floor(Date.now() / 1000);
+  if (!isFinite(reqSec) || Math.abs(nowSec - reqSec) > 300) {
+    return json({ success: false, error: "Forbidden" });
+  }
+  // 🔒 أي Crash غير متوقع هنا يجب ألا يخرج كصفحة HTML من جوجل —
+  // نلتقطه ونرجع JSON دائماً (الموقع fail-soft يتعامل معه بقائمة فارغة).
+  var computedSig;
+  try {
+    computedSig = hmacHex("reviews|" + product + "|" + ts + "|" + nonce, REVIEW_READ_TOKEN);
+  } catch (err) {
+    console.error("HMAC verification crashed:", err);
+    return json({ success: false, error: "Forbidden" });
+  }
+  if (computedSig !== sig) {
+    return json({ success: false, error: "Forbidden" });
+  }
+  // Single-use: طلب محجوب لا يعاد تشغيله حتى لو ضمن نافذة الـ 5 دقائق
+  var nonceKey = "revnonce_" + nonce;
+  if (CacheService.getScriptCache().get(nonceKey) === "1") {
+    return json({ success: false, error: "Forbidden" });
+  }
+  CacheService.getScriptCache().put(nonceKey, "1", 600);
+
+  try {
+    var productId = product.slice(0, 40);
+    var result = { success: true, reviews: [] };
+    if (productId) {
+      // تخزين مؤقت 5 دقائق لكل منتج — يحمي حصة Apps Script من الطلبات المتكررة
+      var cacheKey = "rev_" + productId;
+      var cached = CacheService.getScriptCache().get(cacheKey);
+      if (cached) {
+        try {
+          return json(JSON.parse(cached));
+        } catch (err) {
+          /* كاش تالف — نعيد الحساب */
+        }
+      }
+
+      var sheet = getSpreadsheet().getSheetByName(REVIEWS_SHEET_NAME);
+      if (sheet && sheet.getLastRow() > 1) {
+        var headers = readSheetHeaders(sheet);
+        var colIdx = {
+          productId: -1,
+          status: -1,
+          date: -1,
+          rating: -1,
+          name: -1,
+          text: -1,
+          verified: -1,
+        };
+        for (var i = 0; i < headers.length; i++) {
+          var h = headers[i];
+          if (h === "معرف المنتج") colIdx.productId = i + 1;
+          else if (h === "الحالة") colIdx.status = i + 1;
+          else if (h === "التاريخ") colIdx.date = i + 1;
+          else if (h === "التقييم") colIdx.rating = i + 1;
+          else if (h === "اسم المراجع") colIdx.name = i + 1;
+          else if (h === "المراجعة") colIdx.text = i + 1;
+          else if (h === "شراء موثق") colIdx.verified = i + 1;
+        }
+
+        if (colIdx.productId > 0 && colIdx.status > 0 && colIdx.text > 0) {
+          var rows = sheet
+            .getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn())
+            .getValues();
+          // الأحدث أولاً (الصفوف تُضاف زمنياً)
+          for (var r = rows.length - 1; r >= 0; r--) {
+            if (String(rows[r][colIdx.productId - 1] || "").trim() !== productId) continue;
+            if (String(rows[r][colIdx.status - 1] || "").trim() !== REVIEW_STATUS_APPROVED)
+              continue;
+            var text = String(rows[r][colIdx.text - 1] || "").trim();
+            if (!text) continue;
+            result.reviews.push({
+              // 🔒 الهاتف لا يُكشف أبداً في المخرجات
+              name: String(rows[r][colIdx.name - 1] || "").trim() || "عميل",
+              rating: clampInt(rows[r][colIdx.rating - 1], 1, 5),
+              date: formatCellDate(rows[r][colIdx.date - 1]),
+              text: text.slice(0, REVIEW_MAX_TEXT),
+              verified: String(rows[r][colIdx.verified - 1] || "").trim() === "نعم",
+            });
+            if (result.reviews.length >= REVIEW_LIST_LIMIT) break;
+          }
+        }
+      }
+
+      try {
+        CacheService.getScriptCache().put(cacheKey, JSON.stringify(result), REVIEW_CACHE_TTL_SEC);
+      } catch (err) {
+        /* الكاش تحسين وليس شرطاً */
+      }
+    }
+    return json(result);
+  } catch (err) {
+    // fail-soft: أي خطأ داخلي لا يكسر صفحة المنتج — نرجع قائمة فارغة
+    console.error("Reviews GET error:", err);
+    return json({ success: true, reviews: [] });
+  }
+}
+
+// ============================================================
+// Sheet Management
+// ============================================================
+
+// قراءة موحّدة لعناوين الصف الأول؛ تُستخدم في الكتابة والتحقق والترحيل.
+function readSheetHeaders(sheet, columnCount) {
+  if (typeof columnCount !== "number") columnCount = sheet.getLastColumn();
+  if (columnCount < 1) return [];
+  return sheet
+    .getRange(1, 1, 1, columnCount)
+    .getValues()[0]
+    .map(function (header) {
+      return String(header).trim();
+    });
+}
+
+/**
+ * 🔒 منع حقن الصيغ: أي نص يبدأ بـ = + - @ يُسبق بعلامة اقتباس حتى لا يفسّره
+ * Sheets كصيغة عند الكتابة (Range.setValues).
+ */
+function neutralizeFormula(value) {
+  if (typeof value !== "string") return value;
+  return /^[=+\-@\t\r]/.test(value) ? "'" + value : value;
+}
+
+/**
+ * يطبّق التحصين على كل نص حر داخل صف الطلب.
+ */
+function neutralizeRowValues(valuesByKey, freeTextKeys) {
+  var out = {};
+  for (var key in valuesByKey) {
+    if (!Object.prototype.hasOwnProperty.call(valuesByKey, key)) continue;
+    out[key] =
+      freeTextKeys.indexOf(key) !== -1 ? neutralizeFormula(valuesByKey[key]) : valuesByKey[key];
+  }
+  return out;
+}
+
+function appendRowByHeaders(sheet, columns, valuesByKey) {
+  var lastCol = Math.max(sheet.getLastColumn(), columns.length);
+  var existingHeaders = readSheetHeaders(sheet, lastCol);
+
+  var headerToIndex = {};
+  for (var i = 0; i < existingHeaders.length; i++) {
+    headerToIndex[existingHeaders[i]] = i + 1;
+  }
+
+  var row = new Array(lastCol).fill("");
+  for (var i = 0; i < columns.length; i++) {
+    var col = columns[i];
+    var idx = headerToIndex[col.header];
+    if (idx) {
+      row[idx - 1] = valuesByKey[col.key] !== undefined ? valuesByKey[col.key] : "";
+    }
+  }
+
+  var nextRow = sheet.getLastRow() + 1;
+  // أمان أبعاد: لو الشبكة ممتلئة تماماً ننموّها قبل الكتابة (مسارات runtime
+  // معينة ترفض النطاقات خارج الأبعاد) — النمو عند النهاية لا يزيح بيانات
+  if (nextRow > sheet.getMaxRows()) {
+    sheet.insertRowsAfter(sheet.getMaxRows(), 500);
+  }
+  sheet.getRange(nextRow, 1, 1, row.length).setValues([row]);
+  if (valuesByKey.itemsText !== undefined && headerToIndex["المنتجات"]) {
+    // Presentation is best-effort: a formatting error must not turn an already
+    // recorded order into a reported failure.
+    try {
+      sheet.getRange(nextRow, headerToIndex["المنتجات"]).setWrap(true);
+    } catch (formatError) {
+      console.warn("Could not wrap the new products cell");
+    }
+  }
+
+  // تلوين الصف الجديد بلون خفيف للتمييز
+  if (nextRow % 2 === 0) {
+    sheet.getRange(nextRow, 1, 1, row.length).setBackground("#f8f9fa");
+  }
+}
+
+function getOrCreateSheet(name) {
+  return getOrCreateSheetWithColumns(name, COLUMNS, "orderStatus", [
+    "جديد",
+    "تم التأكيد",
+    "جاري التجهيز",
+    "تم الشحن",
+    "مكتمل",
+    "ملغي",
+    "مرتجع",
+  ]);
+}
+
+/** إخفاء أعمدة الخصم بالاسم فقط، من دون حذفها أو تغيير قيم الصفوف. */
+function hideDiscountColumnsOnSheet(sheet) {
+  var headers = readSheetHeaders(sheet);
+  var hiddenCount = 0;
+  for (var i = 0; i < headers.length; i++) {
+    if (HIDDEN_ORDER_HEADERS.has(headers[i]) && !sheet.isColumnHiddenByUser(i + 1)) {
+      sheet.hideColumns(i + 1);
+      hiddenCount++;
+    }
+  }
+  return hiddenCount;
+}
+
+/** تشغيل يدوي بعد نشر السكربت؛ آمنة عند الإعادة وتحافظ على البيانات. */
+function hideOrderDiscountColumns() {
+  var lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  try {
+    var sheet = getSpreadsheet().getSheetByName(SHEET_NAME);
+    if (!sheet) throw new Error('Sheet "' + SHEET_NAME + '" not found');
+    var hiddenCount = hideDiscountColumnsOnSheet(sheet);
+    return hiddenCount
+      ? "تم إخفاء " + hiddenCount + " عمود خصم؛ البيانات لم تُحذف."
+      : "أعمدة الخصم مخفية بالفعل أو غير موجودة؛ لم تتغير البيانات.";
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/** شيت المراجعات — أعمدة مختلفة عن شيت الطلبات */
+function getOrCreateReviewsSheet() {
+  return getOrCreateSheetWithColumns(REVIEWS_SHEET_NAME, REVIEWS_COLUMNS, "status", [
+    REVIEW_STATUS_PENDING,
+    REVIEW_STATUS_APPROVED,
+    REVIEW_STATUS_REJECTED,
+  ]);
+}
+
+/**
+ * يضمن وجود عمود "وقت الطلب" بجوار "التاريخ" في شيت الطلبات.
+ * عند إدراجه لأول مرة، تُملأ الصفوف القديمة من قيمة Date المحفوظة؛ الصفوف
+ * التي لا تحتوي وقتاً أصلياً تظل فارغة ولا نختلق لها وقتاً.
+ */
+function ensureOrderTimeColumn(sheet, backfillExisting) {
+  var lastColumn = sheet.getLastColumn();
+  if (lastColumn < 1) return { added: false, timeColumn: 0 };
+
+  var headers = readSheetHeaders(sheet, lastColumn);
+  var dateColumn = headers.indexOf("التاريخ") + 1;
+  var timeColumn = headers.indexOf("وقت الطلب") + 1;
+  var inserted = false;
+
+  if (dateColumn > 0 && timeColumn === 0) {
+    sheet.insertColumnAfter(dateColumn);
+    timeColumn = dateColumn + 1;
+    sheet
+      .getRange(1, timeColumn)
+      .setValue("وقت الطلب")
+      .setFontWeight("bold")
+      .setBackground("#1a73e8")
+      .setFontColor("#ffffff")
+      .setHorizontalAlignment("center")
+      .setVerticalAlignment("middle");
+    sheet.setColumnWidth(timeColumn, 105);
+    inserted = true;
+  }
+
+  if (dateColumn > 0 && timeColumn > 0 && (inserted || backfillExisting)) {
+    backfillOrderTimes(sheet, dateColumn, timeColumn);
+  }
+
+  return { added: inserted, timeColumn: timeColumn };
+}
+
+/** يملأ الأوقات الفارغة من الطابع الزمني الأصلي في عمود التاريخ فقط. */
+function backfillOrderTimes(sheet, dateColumn, timeColumn) {
+  var lastRow = sheet.getLastRow();
+  if (lastRow <= 1) return;
+
+  var rowCount = lastRow - 1;
+  var dates = sheet.getRange(2, dateColumn, rowCount, 1).getValues();
+  var existingTimes = sheet.getRange(2, timeColumn, rowCount, 1).getValues();
+  var times = [];
+
+  for (var i = 0; i < rowCount; i++) {
+    var existing = existingTimes[i][0];
+    if (existing !== "" && existing !== null && typeof existing !== "undefined") {
+      times.push([existing]);
+      continue;
+    }
+
+    var timestamp = parseSheetDate(dates[i][0]);
+    times.push([timestamp ? formatOrderTime(timestamp) : ""]);
+  }
+
+  sheet.getRange(2, timeColumn, rowCount, 1).setValues(times);
+}
+
+/**
+ * شغّليها مرة واحدة بعد تحديث السكريبت.
+ * تضيف/تملأ عمود الوقت المجاور للتاريخ، ثم تحذف الأعمدة الملغاة بالاسم
+ * فقط. الحذف مقصود ويشمل بيانات تلك الأعمدة التاريخية؛ الدالة آمنة عند
+ * إعادة التشغيل ولا تحذف أعمدة أخرى.
+ */
+function removeObsoleteOrderColumns(sheet) {
+  var obsoleteHeaders = ["عدد المنتجات", "تم تطبيق خصم", "كود الإحالة", "IP العميل"];
+  var lastColumn = sheet.getLastColumn();
+  if (lastColumn < 1) return 0;
+
+  var headers = readSheetHeaders(sheet, lastColumn);
+  var columnsToDelete = [];
+
+  for (var i = 0; i < headers.length; i++) {
+    if (obsoleteHeaders.indexOf(headers[i]) !== -1) columnsToDelete.push(i + 1);
+  }
+
+  columnsToDelete.sort(function (a, b) {
+    return b - a;
+  });
+  for (var i = 0; i < columnsToDelete.length; i++) {
+    sheet.deleteColumn(columnsToDelete[i]);
+  }
+  return columnsToDelete.length;
+}
+
+function migrateOrderSheetColumns() {
+  var lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  try {
+    var sheet = getSpreadsheet().getSheetByName(SHEET_NAME);
+    if (!sheet) throw new Error('Sheet "' + SHEET_NAME + '" not found');
+
+    var timeResult = ensureOrderTimeColumn(sheet, true);
+    if (!timeResult.timeColumn) throw new Error('Header "التاريخ" not found');
+
+    var deletedCount = removeObsoleteOrderColumns(sheet);
+    var finalHeaders = readSheetHeaders(sheet);
+    var finalTimeColumn = finalHeaders.indexOf("وقت الطلب") + 1;
+    if (finalTimeColumn > 0) sheet.setColumnWidth(finalTimeColumn, 105);
+
+    return "تم تجهيز وقت الطلب وحذف " + deletedCount + " عموداً ملغى";
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function getOrCreateSheetWithColumns(name, columns, statusKey, statusOptions) {
+  var ss = getSpreadsheet();
+  var sheet = ss.getSheetByName(name);
+  var expectedHeaders = columns.map(function (c) {
+    return c.header;
+  });
+
+  if (!sheet) {
+    return createFreshSheet(ss, name, expectedHeaders, columns, statusKey, statusOptions);
+  }
+
+  // عمود الوقت يُدرج مباشرة بعد التاريخ في الشيتات الموجودة، وليس في آخر الأعمدة.
+  // عند الإدراج تُستعاد أوقات الصفوف القديمة من قيمة التاريخ المخزنة إن كانت متاحة.
+  var addedColumn = false;
+  if (name === SHEET_NAME) {
+    var timeColumnResult = ensureOrderTimeColumn(sheet, false);
+    var removedObsoleteColumns = removeObsoleteOrderColumns(sheet);
+    addedColumn = timeColumnResult.added || removedObsoleteColumns > 0;
+  }
+
+  // تأكد من وجود كل الأعمدة المطلوبة حتى لو كان عدد الأعمدة الحالي
+  // مساوياً للعدد المتوقع. النسخة القديمة كانت تفحص العدد فقط؛ فإذا
+  // حُذف/تغيّر اسم عمود مع بقاء العدد نفسه، كانت الكتابات الجديدة تسقط
+  // بصمت من appendRowByHeaders.
+  var currentCols = sheet.getLastColumn();
+  var currentHeaders = readSheetHeaders(sheet, currentCols);
+
+  // أضف الأعمدة الناقصة فقط
+  for (var i = 0; i < expectedHeaders.length; i++) {
+    if (currentHeaders.indexOf(expectedHeaders[i]) === -1) {
+      var newCol = sheet.getLastColumn() + 1;
+      sheet
+        .getRange(1, newCol)
+        .setValue(expectedHeaders[i])
+        .setFontWeight("bold")
+        .setBackground("#1a73e8")
+        .setFontColor("#ffffff");
+      currentHeaders.push(expectedHeaders[i]);
+      addedColumn = true;
+    }
+  }
+  if (addedColumn) sheet.autoResizeColumns(1, sheet.getLastColumn());
+  if (name === SHEET_NAME) {
+    var timeHeaderPosition = currentHeaders.indexOf("وقت الطلب") + 1;
+    if (timeHeaderPosition > 0) sheet.setColumnWidth(timeHeaderPosition, 105);
+  }
+
+  // (2026-09-30) ضمان استمرار تغطية الـ Data Validation لعمود الحالة
+  // (النطاق القديم كان 999 صفاً فقط — وهذه الدعوة تتم لكل كتابة على أي حال)
+  ensureStatusValidation(sheet, columns, statusKey, statusOptions);
+
+  return sheet;
+}
+
+/**
+ * يمدّد نطاق الـ Data Validation لعمود "الحالة" عندما تتجاوزه الصفوف.
+ * الكشف رخيص: نفحص هل الصف التالي لآخر صف مكتوب ما زال مغطاةً خليته؛
+ * إن لم تكن مغطاة ⇒ نعيد تطبيق النطاق حتى آخر الصفوف + هامش 5000.
+ * يصلح أيضاً الشيتات الموجودة فعلياً التي أُنشئت بالنطاق القديم (999).
+ */
+function ensureStatusValidation(sheet, columns, statusKey, statusOptions) {
+  if (!statusKey || !Array.isArray(statusOptions) || statusOptions.length === 0) return;
+  var lastRow = sheet.getLastRow();
+  if (lastRow <= 1) return;
+  var statusColIdx = -1;
+  for (var i = 0; i < columns.length; i++) {
+    if (columns[i].key === statusKey) {
+      statusColIdx = i + 1;
+      break;
+    }
+  }
+  if (statusColIdx <= 0) return;
+  try {
+    var maxRows = sheet.getMaxRows();
+    // هل الصف التالي لآخر صف مكتوب ما زال مغطى بالـ validation؟
+    // (لو الشبكة ممتلئة تماماً فلا تغطية بعد نهايتها بالتعريف)
+    var covered =
+      lastRow + 1 <= maxRows &&
+      Boolean(sheet.getRange(lastRow + 1, statusColIdx).getDataValidation());
+    if (covered) return;
+    var target = lastRow + VALIDATION_ROWS;
+    if (maxRows < target) {
+      sheet.insertRowsAfter(maxRows, target - maxRows);
+    }
+    var validation = SpreadsheetApp.newDataValidation()
+      .requireValueInList(statusOptions)
+      .setAllowInvalid(false)
+      .build();
+    sheet.getRange(2, statusColIdx, target - 1, 1).setDataValidation(validation);
+    console.log("ensureStatusValidation: extended range to row " + target);
+  } catch (err) {
+    console.error("ensureStatusValidation failed:", err);
+  }
+}
+
+function createFreshSheet(ss, name, headers, columns, statusKey, statusOptions) {
+  var sheet = ss.insertSheet(name);
+  sheet.appendRow(headers);
+
+  var headerRange = sheet.getRange(1, 1, 1, headers.length);
+  headerRange
+    .setFontWeight("bold")
+    .setBackground("#1a73e8")
+    .setFontColor("#ffffff")
+    .setHorizontalAlignment("center")
+    .setVerticalAlignment("middle");
+
+  // ضبط عرض كل عمود
+  for (var i = 0; i < columns.length; i++) {
+    if (columns[i].width) {
+      sheet.setColumnWidth(i + 1, columns[i].width);
+    }
+  }
+
+  // إضافة Data Validation لعمود الحالة (حالة الطلب / حالة المراجعة)
+  if (statusKey && Array.isArray(statusOptions) && statusOptions.length > 0) {
+    var statusColIdx = -1;
+    for (var i = 0; i < columns.length; i++) {
+      if (columns[i].key === statusKey) {
+        statusColIdx = i + 1;
+        break;
+      }
+    }
+
+    if (statusColIdx > 0) {
+      var statusValidation = SpreadsheetApp.newDataValidation()
+        .requireValueInList(statusOptions)
+        .setAllowInvalid(false)
+        .build();
+      // النطاق داخل أبعاد الشبكة الحالية فقط (الشيت الجديد شبكته أصغر من
+      // VALIDATION_ROWS والنطاقات خارج الأبعاد غير مضمونة على كل مسارات
+      // الـ runtime) — وensureStatusValidation يمدّد التغطية لاحقاً عند الحاجة
+      var freshRows = Math.min(VALIDATION_ROWS, sheet.getMaxRows()) - 1;
+      sheet.getRange(2, statusColIdx, freshRows, 1).setDataValidation(statusValidation);
+    }
+  }
+
+  // تجميد الصف الأول
+  sheet.setFrozenRows(1);
+
+  // إضافة فلتر تلقائي
+  if (headers.length > 0) {
+    sheet.getRange(1, 1, 1, headers.length).createFilter();
+  }
+
+  return sheet;
+}
+
+// ============================================================
+// Duplicate Detection
+// ============================================================
+
+function isDuplicateOrder(sheet, orderId) {
+  if (!orderId) return false;
+
+  // ابحث في عمود "رقم الطلب"
+  var orderIdColIdx = -1;
+  var lastCol = sheet.getLastColumn();
+  if (lastCol === 0) return false;
+
+  var headers = readSheetHeaders(sheet, lastCol);
+  for (var i = 0; i < headers.length; i++) {
+    if (headers[i] === "رقم الطلب") {
+      orderIdColIdx = i + 1;
+      break;
+    }
+  }
+
+  if (orderIdColIdx <= 0) return false;
+
+  var lastRow = sheet.getLastRow();
+  if (lastRow <= 1) return false;
+
+  // بحث دائم في عمود أرقام الطلبات بالكامل. يعمل داخل ScriptLock في doPost،
+  // لذلك يمنع السباق بين طلبين متزامنين ويحافظ على idempotency حتى للطلبات القديمة.
+  var orderIdRange = sheet.getRange(2, orderIdColIdx, lastRow - 1, 1);
+  var match = orderIdRange
+    .createTextFinder(orderId)
+    .matchEntireCell(true)
+    .matchCase(true)
+    .findNext();
+
+  return Boolean(match);
+}
+
+// ============================================================
+// Email Notification
+// ============================================================
+
+function sendOrderNotification(orderId, name, phone, governorate, total, items) {
+  if (!NOTIFICATION_EMAIL) return;
+
+  try {
+    var subject = "🛒 طلب جديد " + orderId + " — " + name;
+    var body = [
+      "طلب جديد من الإخلاص ميديكال",
+      "",
+      "رقم الطلب: " + orderId,
+      "العميل: " + name,
+      "الهاتف: " + phone,
+      "المحافظة: " + governorate,
+      "الإجمالي: " + total + " ج.م",
+      "",
+      "المنتجات:",
+      items.replace(/ \| /g, "\n"),
+      "",
+      "افتح الشيت: " + getSpreadsheet().getUrl(),
+    ].join("\n");
+
+    MailApp.sendEmail(NOTIFICATION_EMAIL, subject, body);
+  } catch (err) {
+    // لا توقف الطلب بسبب فشل الإيميل
+    console.error("Email notification failed:", err);
+  }
+}
+
+// ============================================================
+// Rate Limiting
+// ============================================================
+
+// مخزن مؤقت بالذاكرة (fallback) — حيّ طوال عمر حاوية الـ runtime.
+var _memoryRateLimit = {};
+
+function checkRateLimit(key) {
+  try {
+    var cache = CacheService.getScriptCache();
+    var cacheKey = "rl_" + key;
+    var current = parseInt(cache.get(cacheKey) || "0", 10);
+    if (current >= RATE_LIMIT_MAX) return false;
+    cache.put(cacheKey, String(current + 1), RATE_LIMIT_WINDOW_SEC);
+    return true;
+  } catch (err) {
+    // (2026-09-15) كان fail-open مطلق (return true) — أي عطل في
+    // CacheService كان بيلغي الـ rate limit بالكامل. دلوقتي فيه fallback
+    // بالذاكرة بنفس الحدود؛ fail-open يبقى آخر حل أخير بس.
+    try {
+      var now = Date.now();
+      var windowMs = RATE_LIMIT_WINDOW_SEC * 1000;
+      var e = _memoryRateLimit[key];
+      if (!e || now - e.start > windowMs) {
+        _memoryRateLimit[key] = { start: now, count: 1 };
+        return true;
+      }
+      e.count += 1;
+      return e.count <= RATE_LIMIT_MAX;
+    } catch (err2) {
+      // (2026-09-15) Fail-closed: فشل كل مستويات الـ limiter (CacheService +
+      // الذاكرة) يعني حالة شاذة — نرفض بدل ما نفتح الباب لطلبات بلا حدود.
+      // الفرع ده عمليًا غير قابل للحدوث (الذاكرة ما تفلتش)، لكن المبدأ:
+      // endpoint مفيش له rate limiter عامل ≠ endpoint آمن.
+      console.error("Rate limiter fully failed (cache + memory) — denying:", err2);
+      return false;
+    }
+  }
+}
+
+// ============================================================
+// Helpers
+// ============================================================
+
+/** Format normalized items for the products cell and order notification email. */
+function formatOrderItemsText(items) {
+  return items
+    .map(function (it, index) {
+      return [
+        "المنتج " + (index + 1) + ": " + it.name,
+        "عدد العبوات: " + it.qty,
+        "سعر العبوة: " + it.price + " ج.م",
+      ].join("\n");
+    })
+    .join("\n\n");
+}
+
+function normalizeItems(rawItems) {
+  if (!Array.isArray(rawItems)) return [];
+  return rawItems
+    .slice(0, MAX_ITEMS)
+    .map(function (it) {
+      return {
+        id: clean(it && it.id, 40),
+        name: clean(it && it.name, MAX_TEXT.itemName),
+        qty: clampInt(it && it.qty, 1, 999),
+        price: clampNumber(it && it.price, 0, 1000000),
+      };
+    })
+    .filter(function (it) {
+      return it.name && it.qty > 0 && it.price >= 0;
+    });
+}
+
+function normalizeOrderType(value) {
+  var v = String(value || "")
+    .toLowerCase()
+    .trim();
+  if (v === "buy-now" || v === "buynow" || v === "شراء فوري") return "شراء فوري";
+  if (v === "cart" || v === "سلة") return "سلة";
+  return v ? clean(v, 30) : "سلة";
+}
+
+// (2026-09-15) توحيد صيغة الهاتف للمطابقة:
+// +201012345678 / 00201012345678 / 01012345678 → 01012345678
+// المشكلة اللي كانت بتحصل: الطلب بيتخزن بصيغة 010... (الفرونت بيعمل
+// normalization) والمراجعة كانت بتتخزن زي ما العميل كتبها (+2010...)
+// → نفس الشخص ما كانش بيتطابق. بنطبع الجانبين وقت المقارنة عشان
+// الصفوف القديمة بأي صيغة تفضل تشتغل.
+function normalizePhoneForMatch(phone) {
+  var digits = String(phone || "").replace(/[^0-9]/g, "");
+  // المصري: 01012345678 (11) / +201012345678 (12) / 00201012345678 (14)
+  // → الصيغة المحلية 010...
+  if (digits.length === 11 && digits.indexOf("01") === 0) return digits;
+  if (digits.length === 12 && digits.indexOf("20") === 0) return "0" + digits.slice(2);
+  if (digits.length === 14 && digits.indexOf("0020") === 0) return "0" + digits.slice(4);
+  // صيغ تانية (أجنبية) → trim خام (التطابق بالـ raw)
+  return String(phone || "").trim();
+}
+
+function clean(value, maxLen) {
+  var cleaned = String(value || "")
+    .replace(/[<>"'&\\]/g, "")
+    // (2026-09-15) كل control characters (بما فيها \n) → مسافة: تمنع حقن
+    // سطور في الإيميلات (customerName يدخل subject الطلب) وفي السجلات.
+    .replace(/[\u0000-\u001F\u007F]/g, " ")
+    .slice(0, maxLen)
+    .trim();
+
+  if (cleaned.match(/^[=\+\-@]/)) {
+    cleaned = "'" + cleaned;
+  }
+  return cleaned;
+}
+
+function numberOrZero(value) {
+  var n = Number(value);
+  return isFinite(n) && n >= 0 ? Math.round(n) : 0;
+}
+
+function clampNumber(value, min, max) {
+  var n = numberOrZero(value);
+  return Math.min(Math.max(n, min), max);
+}
+
+function clampInt(value, min, max) {
+  var n = parseInt(value, 10);
+  if (!isFinite(n)) return min;
+  return Math.min(Math.max(n, min), max);
+}
+
+/** وقت الطلب بصيغة 24 ساعة، محسوب دائماً بتوقيت القاهرة من طابع الخادم. */
+function formatOrderTime(value) {
+  var d = value instanceof Date ? value : parseSheetDate(value);
+  if (!d) return "";
+  return Utilities.formatDate(d, "Africa/Cairo", "HH:mm:ss");
+}
+
+/**
+ * تنسيق التاريخ المُعاد للموقع (المراجعات المعتمدة):
+ * الخلايا تُحفظ ككائن Date منذ 2026-09-15 — وString(Date) كان يخرج بصيغة
+ * محرك JS خام ("Tue Sep 30 2026 ... GMT+0300") تظهر للعميل كما هي.
+ * هنا نوحد العرض: Date أو نص قديم → "d/M/yyyy" بتوقيت القاهرة.
+ */
+function formatCellDate(value) {
+  var d = value instanceof Date ? value : parseSheetDate(value);
+  if (d) {
+    return Utilities.formatDate(d, "Africa/Cairo", "d/M/yyyy");
+  }
+  return String(value || "").trim();
+}
+
+// ============================================================
+// 🔒 حماية بيانات العملاء - GDPR-like
+// ============================================================
+
+/**
+ * تحليل تاريخ الشيت — يدعم الصيغتين:
+ *   1) كائن Date (لو خلية التاريخ محفوظة كتاريخ)
+ *   2) نصوص الصفوف القديمة (قبل 2026-09-15) بصيغة "d/M/yyyy h:mm:ss a" (مثال:
+ *      "14/9/2026 2:30:45 PM" أو بصيغة عربية "14/9/2026 2:30:45 م")
+ * أي فشل في التحليل → null (الصف ما يتشالش أبداً — الأمان قبل التنظيف).
+ */
+function parseSheetDate(value) {
+  if (value instanceof Date) return value;
+  var s = String(value || "").trim();
+  // الصيغة الإنجليزية (en-US locale — الحالة الافتراضية لمعظم المشاريع)
+  var m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})[ T](\d{1,2}):(\d{2}):(\d{2})\s*(AM|PM)$/i);
+  if (m) {
+    var d = new Date(
+      Number(m[3]),
+      Number(m[2]) - 1,
+      Number(m[1]),
+      Number(m[4]) % 12,
+      Number(m[5]),
+      Number(m[6]),
+    );
+    if (/pm/i.test(m[7]) && d.getHours() < 12) d.setHours(d.getHours() + 12);
+    return d;
+  }
+  // الصيغة العربية (لو timezone/لغة المشروع العربية — "م" = مساءً)
+  var m2 = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})[ T](\d{1,2}):(\d{2}):(\d{2})\s*([صم])$/);
+  if (m2) {
+    var d2 = new Date(
+      Number(m2[3]),
+      Number(m2[2]) - 1,
+      Number(m2[1]),
+      Number(m2[4]) % 12,
+      Number(m2[5]),
+      Number(m2[6]),
+    );
+    if (m2[7] === "م" && d2.getHours() < 12) d2.setHours(d2.getHours() + 12);
+    return d2;
+  }
+  return null;
+}
+
+// حذف الطلبات القديمة تلقائياً بعد 90 يوم (لتقليل الاحتفاظ بـ PII)
+function autoCleanupOldOrders() {
+  try {
+    // (2026-09-30) قراءة فقط بدون إنشاء: التنظيف اليومي لا يجب أن ينشئ
+    // تبويبات فارغة إن لم يكن قد وصل أي طلب بعد.
+    var sheet = getSpreadsheet().getSheetByName(SHEET_NAME);
+    if (!sheet) return;
+    var lastRow = sheet.getLastRow();
+    if (lastRow <= 1) return;
+    var headers = readSheetHeaders(sheet);
+    var dateColIdx = 0;
+    for (var i = 0; i < headers.length; i++) {
+      if (headers[i] === "التاريخ") {
+        dateColIdx = i + 1;
+        break;
+      }
+    }
+    if (dateColIdx <= 0) return;
+    var cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - 90);
+    var deleted = 0;
+    // نحذف من الأسفل للأعلى لتجنب إزاحة الصفوف
+    for (var r = lastRow; r >= 2; r--) {
+      var cell = sheet.getRange(r, dateColIdx).getValue();
+      // 🐛 إصلاح (2026-09-14): الصفوف القديمة تاريخها نص منسّق وليس كائن Date —
+      // الاعتماد على `cell instanceof Date` وحده كان يفشل معها دائماً فلا يُحذف
+      // شيء والـ PII يتراكم. الآن تُحلل الصيغتان (كائن Date + النص القديم).
+      var cellDate = parseSheetDate(cell);
+      if (cellDate && cellDate < cutoff) {
+        sheet.deleteRow(r);
+        deleted++;
+      }
+    }
+    if (deleted > 0)
+      console.log("autoCleanupOldOrders: deleted " + deleted + " order(s) older than 90 days.");
+
+    // (2026-09-15) سياسة retention للمراجعات: المراجعة "المرفوضة" قديمة
+    // (>90 يوم) = PII (اسم + هاتف) لن تُعرض أبدًا → حذف. المعتمدة تفضل
+    // (محتوى عام منشور على الموقع) والقيد المراجعة تفضل (لسه ممكن تعتمد).
+    cleanupOldRejectedReviews();
+  } catch (err) {
+    console.error("autoCleanupOldOrders failed:", err);
+  }
+}
+
+/** حذف المراجعات المرفوضة الأقدم من 90 يوم (سياسة PII retention للمراجعات). */
+function cleanupOldRejectedReviews() {
+  try {
+    // قراءة فقط بدون إنشاء (نفس مبدأ autoCleanupOldOrders)
+    var sheet = getSpreadsheet().getSheetByName(REVIEWS_SHEET_NAME);
+    if (!sheet) return;
+    var lastRow = sheet.getLastRow();
+    if (lastRow <= 1) return;
+    var headers = readSheetHeaders(sheet);
+    var dateCol = -1,
+      statusCol = -1;
+    for (var i = 0; i < headers.length; i++) {
+      var h = headers[i];
+      if (h === "التاريخ") dateCol = i + 1;
+      else if (h === "الحالة") statusCol = i + 1;
+    }
+    if (dateCol <= 0 || statusCol <= 0) return;
+    var cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - 90);
+    var deleted = 0;
+    for (var r = lastRow; r >= 2; r--) {
+      var status = String(sheet.getRange(r, statusCol).getValue() || "").trim();
+      if (status !== "مرفوض") continue;
+      var cellDate = parseSheetDate(sheet.getRange(r, dateCol).getValue());
+      if (cellDate && cellDate < cutoff) {
+        sheet.deleteRow(r);
+        deleted++;
+      }
+    }
+    if (deleted > 0)
+      console.log(
+        "cleanupOldRejectedReviews: deleted " + deleted + " rejected review(s) older than 90 days.",
+      );
+  } catch (err) {
+    console.error("cleanupOldRejectedReviews failed:", err);
+  }
+}
+
+/**
+ * ⏰ شغّلي هذه الدالة مرة واحدة من محرر Apps Script (Run) لإنشاء trigger
+ * يومي ينفذ autoCleanupOldOrders() (حذف طلبات أقدم من 90 يوم).
+ * إعادة التشغيل آمنة: يحذف أولاً أي triggers قديمة لنفس الدالة.
+ */
+// ملاحظة: atHour(3) يعتمد على timezone مشروع Apps Script نفسه
+// (Settings → All project settings → Time zone) — تأكد أنه Africa/Cairo
+// أو اضبط الساعة على ما يناسب توقيت المشروع.
+function setupAutoCleanupTrigger() {
+  ScriptApp.getProjectTriggers().forEach(function (t) {
+    if (t.getHandlerFunction() === "autoCleanupOldOrders") {
+      ScriptApp.deleteTrigger(t);
+    }
+  });
+  ScriptApp.newTrigger("autoCleanupOldOrders").timeBased().everyDays(1).atHour(3).create();
+  console.log("Daily trigger for autoCleanupOldOrders created.");
+}
+
+function json(obj) {
+  return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(
+    ContentService.MimeType.JSON,
+  );
+}

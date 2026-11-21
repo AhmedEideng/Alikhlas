@@ -1,0 +1,167 @@
+{
+  "GOVERNORATE_SHIPPING": [
+    {
+      "name": "القاهرة",
+      "shipping": 50,
+      "region": "القاهرة والجيزة"
+    },
+    {
+      "name": "الإسكندرية",
+      "shipping": 70,
+      "region": "وجه بحري"
+    },
+    {
+      "name": "الجيزة",
+      "shipping": 50,
+      "region": "القاهرة والجيزة"
+    },
+    {
+      "name": "القليوبية",
+      "shipping": 70,
+      "region": "وجه بحري"
+    },
+    {
+      "name": "البحيرة",
+      "shipping": 70,
+      "region": "وجه بحري"
+    },
+    {
+      "name": "مطروح",
+      "shipping": 120,
+      "region": "وجه بحري"
+    },
+    {
+      "name": "دمياط",
+      "shipping": 70,
+      "region": "وجه بحري"
+    },
+    {
+      "name": "الدقهلية",
+      "shipping": 70,
+      "region": "وجه بحري"
+    },
+    {
+      "name": "الشرقية",
+      "shipping": 70,
+      "region": "وجه بحري"
+    },
+    {
+      "name": "الغربية",
+      "shipping": 70,
+      "region": "وجه بحري"
+    },
+    {
+      "name": "المنوفية",
+      "shipping": 70,
+      "region": "وجه بحري"
+    },
+    {
+      "name": "كفر الشيخ",
+      "shipping": 70,
+      "region": "وجه بحري"
+    },
+    {
+      "name": "الإسماعيلية",
+      "shipping": 70,
+      "region": "وجه بحري"
+    },
+    {
+      "name": "السويس",
+      "shipping": 70,
+      "region": "وجه بحري"
+    },
+    {
+      "name": "بورسعيد",
+      "shipping": 70,
+      "region": "وجه بحري"
+    },
+    {
+      "name": "شمال سيناء",
+      "shipping": 120,
+      "region": "سيناء"
+    },
+    {
+      "name": "جنوب سيناء",
+      "shipping": 120,
+      "region": "سيناء"
+    },
+    {
+      "name": "البحر الأحمر",
+      "shipping": 120,
+      "region": "وجه قبلي"
+    },
+    {
+      "name": "الفيوم",
+      "shipping": 90,
+      "region": "وجه قبلي"
+    },
+    {
+      "name": "بني سويف",
+      "shipping": 90,
+      "region": "وجه قبلي"
+    },
+    {
+      "name": "المنيا",
+      "shipping": 90,
+      "region": "وجه قبلي"
+    },
+    {
+      "name": "أسيوط",
+      "shipping": 90,
+      "region": "وجه قبلي"
+    },
+    {
+      "name": "سوهاج",
+      "shipping": 90,
+      "region": "وجه قبلي"
+    },
+    {
+      "name": "قنا",
+      "shipping": 90,
+      "region": "وجه قبلي"
+    },
+    {
+      "name": "الأقصر",
+      "shipping": 90,
+      "region": "وجه قبلي"
+    },
+    {
+      "name": "أسوان",
+      "shipping": 90,
+      "region": "وجه قبلي"
+    },
+    {
+      "name": "الوادي الجديد",
+      "shipping": 90,
+      "region": "وجه قبلي"
+    }
+  ],
+  "FREE_SHIPPING_THRESHOLD": 2000,
+  "PROMO_TIERS": [
+    {
+      "threshold": 2000,
+      "discount": 0.2,
+      "label": "20%",
+      "icon": "🥇",
+      "name": "الدرجة الثالثة، توفير ٢٠٪",
+      "color": "from-[#e9b62c] to-[#8f6508]"
+    },
+    {
+      "threshold": 1500,
+      "discount": 0.15,
+      "label": "15%",
+      "icon": "🥈",
+      "name": "الدرجة الثانية، توفير ١٥٪",
+      "color": "from-[#0d7a43] to-[#064e2b]"
+    },
+    {
+      "threshold": 1000,
+      "discount": 0.1,
+      "label": "10%",
+      "icon": "🥉",
+      "name": "الدرجة الأولى، توفير ١٠٪",
+      "color": "from-[#0b6b3a] to-[#095930]"
+    }
+  ],
+  "BUNDLE_DISCOUNT_RATE": 0.2
+}
